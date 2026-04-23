@@ -1,0 +1,52 @@
+# Local dev stack for socc-plugin.
+#
+# Usage:
+#   cd scratch/socc-plugin
+#   cp .env.example .env    # fill in SOCC_JWT_SECRET + SOCC_CREDENTIALS_MASTER_KEY
+#   docker compose up --build
+#
+# Generate fresh secrets with:
+#   openssl rand -hex 32   # for each secret
+
+services:
+  socc-plugin:
+    build:
+      # Context is the parent so the Dockerfile can COPY ../socc.
+      context: ..
+      dockerfile: socc-plugin/Dockerfile
+    image: socc-plugin:dev
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      PORT: 8787
+      MONGO_URI: mongodb://socc-mongo:27017
+      MONGO_DB: socc_plugin
+      SOCC_JWT_SECRET: ${SOCC_JWT_SECRET:?set SOCC_JWT_SECRET in .env}
+      SOCC_CREDENTIALS_MASTER_KEY: ${SOCC_CREDENTIALS_MASTER_KEY:?set SOCC_CREDENTIALS_MASTER_KEY in .env}
+      SESSION_TTL_MS: ${SESSION_TTL_MS:-900000}
+      MAX_CONCURRENT_SESSIONS: ${MAX_CONCURRENT_SESSIONS:-50}
+    depends_on:
+      socc-mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  socc-mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - socc-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  socc-mongo-data:

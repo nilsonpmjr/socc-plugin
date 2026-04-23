@@ -1,0 +1,15 @@
+# Applies to this directory when it is the build context. When the build
+# context is the parent (scratch/), compose.yml passes a context-level
+# .dockerignore via --ignorefile if needed.
+
+node_modules
+dist
+.env
+.env.*
+*.log
+.git
+.gitignore
+coverage
+.vscode
+.idea
+bun.lockb.tmp

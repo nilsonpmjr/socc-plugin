@@ -1,0 +1,273 @@
+// Worker pool — one Bun Worker per active session.
+//
+// The pool owns Worker lifetimes and the message protocol defined in
+// sessionWorker.ts. It doesn't know about users, Mongo, or HTTP; see
+// sessionManager.ts for those concerns.
+//
+// Design choices:
+// - We don't recycle Workers across sessions. socc's STATE singleton is
+//   full of per-session bookkeeping and clearing it by hand is fragile.
+//   Terminate → respawn is simpler and the startup cost is tolerable.
+// - Turn events fan out through a per-turn AsyncIterableIterator. The
+//   Hono SSE handler consumes it; if the client disconnects, the handler
+//   calls abortTurn() and the Worker bails out of query().
+
+import type {
+  WorkerEventMessage,
+  WorkerInboundMessage,
+  WorkerInitMessage,
+  WorkerOutboundMessage,
+  WorkerTurnEndMessage,
+} from '../sessionWorker.ts'
+
+export type SessionInit = Omit<WorkerInitMessage, 'type'>
+
+export type TurnEvent =
+  | { kind: 'engine'; event: unknown }
+  | { kind: 'end'; reason: 'complete' | 'aborted' | 'error'; errorMessage?: string }
+
+export class WorkerPool {
+  private readonly workers = new Map<string, WorkerSlot>()
+  private readonly maxConcurrent: number
+
+  constructor(options: { maxConcurrent: number }) {
+    this.maxConcurrent = options.maxConcurrent
+  }
+
+  has(sessionId: string): boolean {
+    return this.workers.has(sessionId)
+  }
+
+  size(): number {
+    return this.workers.size
+  }
+
+  // Idempotent: a second spawn for the same sessionId is a no-op if the
+  // slot is healthy, or a silent replace if it crashed.
+  async spawn(init: SessionInit): Promise<void> {
+    const existing = this.workers.get(init.sessionId)
+    if (existing && !existing.dead) return
+    if (existing?.dead) this.workers.delete(init.sessionId)
+
+    if (this.workers.size >= this.maxConcurrent) {
+      throw new PoolCapacityError(
+        `max concurrent sessions reached (${this.maxConcurrent})`,
+      )
+    }
+
+    const slot = new WorkerSlot(init)
+    this.workers.set(init.sessionId, slot)
+    try {
+      await slot.ready()
+    } catch (err) {
+      this.workers.delete(init.sessionId)
+      slot.terminate()
+      throw err
+    }
+  }
+
+  // Streams TurnEvents for a single user turn. The iterator closes after
+  // {kind:'end'}; callers must drain it or call abortTurn() to avoid
+  // leaking the current turn's state inside the Worker.
+  async *run(sessionId: string, turnId: string, text: string): AsyncGenerator<TurnEvent> {
+    const slot = this.workers.get(sessionId)
+    if (!slot) throw new SessionNotFoundError(sessionId)
+    if (slot.dead) throw new SessionNotFoundError(sessionId)
+
+    const stream = slot.beginTurn(turnId)
+    slot.post({ type: 'prompt', turnId, text })
+    try {
+      for await (const ev of stream) yield ev
+    } finally {
+      slot.endTurn(turnId)
+    }
+  }
+
+  abortTurn(sessionId: string, turnId?: string): void {
+    const slot = this.workers.get(sessionId)
+    if (!slot || slot.dead) return
+    slot.post({ type: 'abort', turnId })
+  }
+
+  // Terminates a single session's Worker. Safe to call for unknown ids.
+  shutdown(sessionId: string): void {
+    const slot = this.workers.get(sessionId)
+    if (!slot) return
+    this.workers.delete(sessionId)
+    slot.post({ type: 'shutdown' })
+    // Give the worker a moment to flush; then hard-terminate.
+    setTimeout(() => slot.terminate(), 100)
+  }
+
+  // Terminate everything. Used on process shutdown.
+  shutdownAll(): void {
+    for (const id of [...this.workers.keys()]) this.shutdown(id)
+  }
+}
+
+// A single slot in the pool — wraps one Worker and its in-flight turn.
+class WorkerSlot {
+  readonly sessionId: string
+  private worker: Worker
+  private readyPromise: Promise<void>
+  private resolveReady!: () => void
+  private rejectReady!: (err: Error) => void
+  // Current turn plumbing. Only one turn is in flight at a time; the
+  // Worker enforces this too, but gating at the slot saves a round trip.
+  private turn: {
+    id: string
+    queue: TurnEvent[]
+    waiters: Array<(v: IteratorResult<TurnEvent>) => void>
+    ended: boolean
+  } | null = null
+  dead = false
+
+  constructor(init: SessionInit) {
+    this.sessionId = init.sessionId
+    // In dev, the worker source sits at ../sessionWorker.ts. When the
+    // server is bundled for prod, bun emits ../sessionWorker.mjs next to
+    // the main bundle; SOCC_WORKER_URL lets the container point at it.
+    const workerUrl =
+      process.env.SOCC_WORKER_URL ??
+      new URL('../sessionWorker.ts', import.meta.url).href
+    this.worker = new Worker(workerUrl, {
+      type: 'module',
+    })
+    this.readyPromise = new Promise((res, rej) => {
+      this.resolveReady = res
+      this.rejectReady = rej
+    })
+
+    this.worker.addEventListener('message', (ev: MessageEvent<WorkerOutboundMessage>) => {
+      this.onMessage(ev.data)
+    })
+    this.worker.addEventListener('error', (ev: ErrorEvent) => {
+      this.onFatal(ev.message || 'worker error')
+    })
+    this.worker.addEventListener('messageerror', () => {
+      this.onFatal('worker messageerror')
+    })
+
+    this.post({ type: 'init', ...init })
+  }
+
+  ready(): Promise<void> {
+    return this.readyPromise
+  }
+
+  post(msg: WorkerInboundMessage): void {
+    if (this.dead) return
+    this.worker.postMessage(msg)
+  }
+
+  beginTurn(turnId: string): AsyncIterable<TurnEvent> {
+    if (this.turn) {
+      throw new TurnConflictError('another turn is in flight')
+    }
+    const turn: NonNullable<WorkerSlot['turn']> = {
+      id: turnId,
+      queue: [],
+      waiters: [],
+      ended: false,
+    }
+    this.turn = turn
+
+    const iter: AsyncIterator<TurnEvent> = {
+      next: () =>
+        new Promise<IteratorResult<TurnEvent>>((resolve) => {
+          if (turn.queue.length > 0) {
+            resolve({ value: turn.queue.shift()!, done: false })
+            return
+          }
+          if (turn.ended) {
+            resolve({ value: undefined, done: true })
+            return
+          }
+          turn.waiters.push(resolve)
+        }),
+    }
+    return { [Symbol.asyncIterator]: () => iter }
+  }
+
+  endTurn(turnId: string): void {
+    if (this.turn?.id === turnId) this.turn = null
+  }
+
+  private onMessage(msg: WorkerOutboundMessage): void {
+    switch (msg.type) {
+      case 'ready':
+        this.resolveReady()
+        return
+      case 'event':
+        this.pushTurn(msg.turnId, { kind: 'engine', event: (msg as WorkerEventMessage).event })
+        return
+      case 'turn_end': {
+        const m = msg as WorkerTurnEndMessage
+        this.pushTurn(m.turnId, {
+          kind: 'end',
+          reason: m.reason,
+          errorMessage: m.errorMessage,
+        })
+        this.closeTurn(m.turnId)
+        return
+      }
+      case 'error':
+        if (msg.fatal) this.onFatal(msg.message)
+        return
+    }
+  }
+
+  private pushTurn(turnId: string, ev: TurnEvent): void {
+    const t = this.turn
+    if (!t || t.id !== turnId) return
+    const waiter = t.waiters.shift()
+    if (waiter) {
+      waiter({ value: ev, done: false })
+    } else {
+      t.queue.push(ev)
+    }
+  }
+
+  private closeTurn(turnId: string): void {
+    const t = this.turn
+    if (!t || t.id !== turnId) return
+    t.ended = true
+    while (t.waiters.length > 0) {
+      const waiter = t.waiters.shift()!
+      waiter({ value: undefined, done: true })
+    }
+  }
+
+  private onFatal(message: string): void {
+    this.dead = true
+    if (this.turn) {
+      this.pushTurn(this.turn.id, { kind: 'end', reason: 'error', errorMessage: message })
+      this.closeTurn(this.turn.id)
+    }
+    this.rejectReady(new Error(message))
+  }
+
+  terminate(): void {
+    this.dead = true
+    try {
+      this.worker.terminate()
+    } catch {
+      // worker may already be gone; ignore
+    }
+  }
+}
+
+export class PoolCapacityError extends Error {
+  readonly code = 'pool_capacity'
+}
+
+export class SessionNotFoundError extends Error {
+  readonly code = 'session_not_found'
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} not found`)
+  }
+}
+
+export class TurnConflictError extends Error {
+  readonly code = 'turn_conflict'
+}

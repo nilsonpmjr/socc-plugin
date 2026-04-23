@@ -1,0 +1,115 @@
+# Vantage extension manifest — read by the /extensions page to render
+# the install card and by the installer service to start the container.
+#
+# This manifest is deliberately declarative: NO install scripts, NO
+# arbitrary shell, NO host mounts. The extensions service validates
+# every field against a whitelist before wiring it up.
+
+apiVersion: vantage.extensions/v1
+kind: Extension
+
+metadata:
+  id: socc
+  name: SOC Copilot
+  version: 0.1.0
+  vendor: VantageSec
+  homepage: https://github.com/nilsonpmjr/socc-plugin
+  description: >
+    Conversational SOC assistant backed by @vantagesec/socc. Each analyst
+    gets an isolated session with their own LLM credentials; nothing is
+    shared across users.
+  icon: assets/icon.svg        # rendered in the catalog card
+  tags:
+    - ai
+    - chat
+    - soc
+    - analyst-productivity
+
+spec:
+  # Container image. Pinned by digest in production; tag-based here for
+  # MVP. The installer refuses `:latest`.
+  image: ghcr.io/nilsonpmjr/socc-plugin:0.1.0
+
+  # How the Vantage backend reaches the plugin. The plugin listens on
+  # this port inside its container; Vantage's reverse proxy routes
+  # /extensions/socc/* → this service.
+  service:
+    port: 8787
+    protocol: http
+    healthcheck:
+      path: /health
+      intervalSeconds: 30
+      timeoutSeconds: 3
+
+  # Environment the installer must supply. Types are validated; `secret`
+  # variables are provisioned from Vantage's secret store and never
+  # shown in logs or the UI.
+  env:
+    - name: MONGO_URI
+      required: true
+      type: string
+      default: mongodb://socc-mongo:27017
+      description: MongoDB connection string (credentials + session metadata).
+    - name: MONGO_DB
+      required: false
+      type: string
+      default: socc_plugin
+    - name: SOCC_JWT_SECRET
+      required: true
+      type: secret
+      description: 32-byte HS256 secret shared with Vantage for signing plugin JWTs.
+    - name: SOCC_CREDENTIALS_MASTER_KEY
+      required: true
+      type: secret
+      description: 32-byte hex key for libsodium secretbox envelope encryption.
+    - name: SESSION_TTL_MS
+      required: false
+      type: integer
+      default: 900000
+    - name: MAX_CONCURRENT_SESSIONS
+      required: false
+      type: integer
+      default: 50
+
+  # Declarative dependencies spun up alongside the extension. The
+  # extensions service is the only thing that may touch docker-socket-proxy.
+  dependencies:
+    - id: socc-mongo
+      kind: sidecar
+      image: mongo:7
+      volumes:
+        - name: socc-mongo-data
+          path: /data/db
+      env:
+        MONGO_INITDB_DATABASE: socc_plugin
+
+  # Capabilities the extension declares it needs. Anything not listed
+  # here is denied by the extensions service.
+  permissions:
+    network:
+      egress:
+        - reason: reach LLM providers
+          hosts:
+            - api.anthropic.com
+            - api.openai.com
+            - generativelanguage.googleapis.com
+    storage:
+      mongoDatabase: socc_plugin     # isolated DB; no cross-extension reads
+
+  # How Vantage users find and install it.
+  ui:
+    category: Analyst Tools
+    install:
+      requiredRoles:
+        - admin
+      prompts:
+        - field: SOCC_JWT_SECRET
+          label: JWT signing secret (64 hex chars)
+          pattern: "^[0-9a-fA-F]{64}$"
+        - field: SOCC_CREDENTIALS_MASTER_KEY
+          label: Credentials encryption key (64 hex chars)
+          pattern: "^[0-9a-fA-F]{64}$"
+    routes:
+      - path: /chat
+        title: SOC Copilot
+        component: SoccChatPage       # frontend component key

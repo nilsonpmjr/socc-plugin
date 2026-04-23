@@ -13,12 +13,13 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@hono/node-server": "1.13.8",
     "@vantagesec/socc": "file:../socc",
     "hono": "4.6.20",
-    "@hono/node-server": "1.13.8",
     "jose": "5.9.6",
     "libsodium-wrappers": "0.7.15",
     "mongodb": "6.11.0",
+    "ulid": "2.3.0",
     "zod": "3.25.76"
   },
   "devDependencies": {
