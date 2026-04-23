@@ -1,0 +1,46 @@
+{
+  "name": "socc-plugin",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Headless SOCC server — multi-tenant SSE gateway backed by @vantagesec/socc, one Bun Worker per session",
+  "type": "module",
+  "main": "src/server/index.ts",
+  "scripts": {
+    "dev": "bun run --hot src/server/index.ts",
+    "start": "bun run src/server/index.ts",
+    "build": "bun build src/server/index.ts --target=bun --outfile=dist/server.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@vantagesec/socc": "file:../socc",
+    "hono": "4.6.20",
+    "@hono/node-server": "1.13.8",
+    "jose": "5.9.6",
+    "libsodium-wrappers": "0.7.15",
+    "mongodb": "6.11.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "@types/libsodium-wrappers": "0.7.14",
+    "@types/node": "25.5.0",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "bun": ">=1.3.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nilsonpmjr/socc-plugin.git"
+  },
+  "keywords": [
+    "socc",
+    "plugin",
+    "sse",
+    "security",
+    "llm",
+    "vantage"
+  ],
+  "license": "SEE LICENSE FILE"
+}
