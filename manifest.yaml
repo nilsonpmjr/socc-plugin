@@ -1,115 +1,51 @@
-# Vantage extension manifest — read by the /extensions page to render
-# the install card and by the installer service to start the container.
+# Vantage extension manifest — consumed by the ExtensionManager
+# (backend/services/extensions/manifest.py) during install.
 #
-# This manifest is deliberately declarative: NO install scripts, NO
-# arbitrary shell, NO host mounts. The extensions service validates
-# every field against a whitelist before wiring it up.
+# Schema matches PRD §Extensions Platform (socc-copilot-plugin.md,
+# lines 212–247). The parser validates every field against a strict
+# pydantic schema; no arbitrary shell, no host mounts, no env-var
+# expansion beyond the declared `secrets` + `settings`.
 
-apiVersion: vantage.extensions/v1
-kind: Extension
+id: socc
+name: SOC Copilot
+description: Conversational LLM assistant for threat triage.
+version: 0.1.0
+compose_file: ./compose.yml
 
-metadata:
-  id: socc
-  name: SOC Copilot
-  version: 0.1.0
-  vendor: VantageSec
-  homepage: https://github.com/nilsonpmjr/socc-plugin
-  description: >
-    Conversational SOC assistant backed by @vantagesec/socc. Each analyst
-    gets an isolated session with their own LLM credentials; nothing is
-    shared across users.
-  icon: assets/icon.svg        # rendered in the catalog card
-  tags:
-    - ai
-    - chat
-    - soc
-    - analyst-productivity
+# Ops exposed in the UI. Order = order of display.
+operations: [install, start, stop, restart, logs, uninstall]
 
-spec:
-  # Container image. Pinned by digest in production; tag-based here for
-  # MVP. The installer refuses `:latest`.
-  image: ghcr.io/nilsonpmjr/socc-plugin:0.1.0
+# Health endpoint hit by the backend via the internal Docker network.
+health:
+  url: http://socc-copilot:7070/v1/health
+  interval_seconds: 15
+  timeout_seconds: 3
 
-  # How the Vantage backend reaches the plugin. The plugin listens on
-  # this port inside its container; Vantage's reverse proxy routes
-  # /extensions/socc/* → this service.
-  service:
-    port: 8787
-    protocol: http
-    healthcheck:
-      path: /health
-      intervalSeconds: 30
-      timeoutSeconds: 3
+# Secrets the installer generates/provisions. `random_bytes_base64` is
+# the ExtensionManager-side generator; length is in bytes.
+secrets:
+  - name: SOCC_MASTER_KEY
+    generator: random_bytes_base64
+    length: 32
+  - name: SOCC_INTERNAL_SECRET
+    generator: random_bytes_base64
+    length: 32
 
-  # Environment the installer must supply. Types are validated; `secret`
-  # variables are provisioned from Vantage's secret store and never
-  # shown in logs or the UI.
-  env:
-    - name: MONGO_URI
-      required: true
-      type: string
-      default: mongodb://socc-mongo:27017
-      description: MongoDB connection string (credentials + session metadata).
-    - name: MONGO_DB
-      required: false
-      type: string
-      default: socc_plugin
-    - name: SOCC_JWT_SECRET
-      required: true
-      type: secret
-      description: 32-byte HS256 secret shared with Vantage for signing plugin JWTs.
-    - name: SOCC_CREDENTIALS_MASTER_KEY
-      required: true
-      type: secret
-      description: 32-byte hex key for libsodium secretbox envelope encryption.
-    - name: SESSION_TTL_MS
-      required: false
-      type: integer
-      default: 900000
-    - name: MAX_CONCURRENT_SESSIONS
-      required: false
-      type: integer
-      default: 50
+# Pre-flight checks enforced before Install is allowed.
+requires:
+  docker_socket_proxy: true
+  disk_space_mb: 512
+  ports: []          # nothing exposed to the host
 
-  # Declarative dependencies spun up alongside the extension. The
-  # extensions service is the only thing that may touch docker-socket-proxy.
-  dependencies:
-    - id: socc-mongo
-      kind: sidecar
-      image: mongo:7
-      volumes:
-        - name: socc-mongo-data
-          path: /data/db
-      env:
-        MONGO_INITDB_DATABASE: socc_plugin
+# Admin-editable flags surfaced in the extension's Settings modal.
+settings:
+  - key: SOCC_ALLOW_LOCAL_PROVIDERS
+    type: boolean
+    default: false
+    label: "Permitir provedores locais (Ollama)"
 
-  # Capabilities the extension declares it needs. Anything not listed
-  # here is denied by the extensions service.
-  permissions:
-    network:
-      egress:
-        - reason: reach LLM providers
-          hosts:
-            - api.anthropic.com
-            - api.openai.com
-            - generativelanguage.googleapis.com
-    storage:
-      mongoDatabase: socc_plugin     # isolated DB; no cross-extension reads
-
-  # How Vantage users find and install it.
-  ui:
-    category: Analyst Tools
-    install:
-      requiredRoles:
-        - admin
-      prompts:
-        - field: SOCC_JWT_SECRET
-          label: JWT signing secret (64 hex chars)
-          pattern: "^[0-9a-fA-F]{64}$"
-        - field: SOCC_CREDENTIALS_MASTER_KEY
-          label: Credentials encryption key (64 hex chars)
-          pattern: "^[0-9a-fA-F]{64}$"
-    routes:
-      - path: /chat
-        title: SOC Copilot
-        component: SoccChatPage       # frontend component key
+# Uninstall behavior. The confirm phrase must be typed literally in the
+# destructive modal.
+uninstall:
+  destroy_volumes_by_default: true
+  confirm_phrase: "uninstall socc"

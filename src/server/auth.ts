@@ -13,8 +13,8 @@
 //   exp   — short TTL (≤ 60s); jose enforces
 //   iat   — token mint time
 //
-// The shared secret comes from SOCC_JWT_SECRET. In prod it's rotated by
-// redeploying both sides; there's no in-band rotation for the MVP.
+// The shared secret comes from SOCC_INTERNAL_SECRET. In prod it's rotated
+// by redeploying both sides; there's no in-band rotation for the MVP.
 
 import { jwtVerify, type JWTPayload } from 'jose'
 
@@ -57,7 +57,7 @@ export class JwtVerifier {
     const buf = Buffer.from(secretHex, 'hex')
     if (buf.length < 32) {
       throw new Error(
-        `SOCC_JWT_SECRET must be at least 32 bytes (64 hex chars); got ${buf.length} bytes`,
+        `SOCC_INTERNAL_SECRET must be at least 32 bytes (64 hex chars); got ${buf.length} bytes`,
       )
     }
     this.secret = new Uint8Array(buf)

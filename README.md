@@ -62,13 +62,13 @@ git clone https://github.com/nilsonpmjr/socc-plugin.git
 cd socc-plugin
 
 bun install
-bun test                 # 52 tests, no network/mongo needed
+bun test                 # 52+ tests, no network/mongo needed
 bun run typecheck
 
 cp .env.example .env
-# fill SOCC_JWT_SECRET and SOCC_CREDENTIALS_MASTER_KEY with:
+# fill SOCC_INTERNAL_SECRET and SOCC_MASTER_KEY with:
 #   openssl rand -hex 32
-bun run dev              # :8787
+bun run dev              # :7070
 ```
 
 Or with Docker:
@@ -77,47 +77,65 @@ Or with Docker:
 # From scratch/socc-plugin:
 cp .env.example .env     # fill secrets as above
 docker compose up --build
-curl http://localhost:8787/health
+curl http://localhost:7070/v1/health
 ```
 
 ## API surface
 
-All routes except `/health` require `Authorization: Bearer <jwt>`
-signed with `SOCC_JWT_SECRET`, issuer `vantage`, audience `socc-plugin`,
-scope `socc`.
+All routes under `/v1` except `/v1/health` require
+`Authorization: Bearer <jwt>` signed with `SOCC_INTERNAL_SECRET`,
+issuer `vantage`, audience `socc-plugin`, scope `socc`.
 
-| Method | Path                          | Purpose                                        |
-|--------|-------------------------------|------------------------------------------------|
-| GET    | `/health`                     | liveness + active session count                |
-| POST   | `/credentials`                | store an encrypted LLM provider key            |
-| GET    | `/credentials`                | list the caller's credentials (metadata only)  |
-| DELETE | `/credentials/:id`            | revoke                                         |
-| POST   | `/sessions`                   | spawn a worker bound to a credential           |
-| GET    | `/sessions`                   | list the caller's live sessions                |
-| DELETE | `/sessions/:id`               | terminate the worker                           |
-| POST   | `/sessions/:id/turns`         | **SSE**: stream a user turn                    |
-| POST   | `/sessions/:id/abort`         | cancel the in-flight turn                      |
+| Method | Path                                 | Purpose                                        |
+|--------|--------------------------------------|------------------------------------------------|
+| GET    | `/v1/health`                         | liveness + active session count                |
+| POST   | `/v1/credentials`                    | store an encrypted LLM provider key            |
+| GET    | `/v1/credentials`                    | list the caller's credentials (metadata only)  |
+| DELETE | `/v1/credentials/:id`                | revoke                                         |
+| POST   | `/v1/credentials/:id/test`           | test provider reachability + record result     |
+| POST   | `/v1/session`                        | spawn a worker bound to a credential           |
+| GET    | `/v1/session`                        | list the caller's live sessions                |
+| DELETE | `/v1/session/:id`                    | terminate the worker                           |
+| POST   | `/v1/session/:id/message`            | **SSE**: stream a user turn (PRD name)         |
+| POST   | `/v1/session/:id/turns`              | alias for `/message` (legacy)                  |
+| POST   | `/v1/session/:id/abort`              | cancel the in-flight turn                      |
 
-SSE event types: `message.start`, `content.delta`, `content.done`,
-`tool.call.start`, `tool.call.end`, `message.end`, `error`, `heartbeat`.
-See [src/server/streamAdapter.ts](src/server/streamAdapter.ts) for the
-full payload shapes.
+SSE event types: `session.ready`, `message.start`, `content.delta`,
+`content.done` (with `content` + `usage`), `tool.call.start`,
+`tool.call.end`, `message.end` (with `stopReason`), `error` (with
+reserved `code`), `heartbeat` (with `ts`). See
+[src/server/streamAdapter.ts](src/server/streamAdapter.ts) for the full
+payload shapes.
+
+Reserved error codes (PRD §Security): `provider_unauthorized`,
+`provider_rate_limited`, `provider_unavailable`, `session_not_found`,
+`session_forbidden`, `socc_unavailable`, `socc_not_installed`,
+`local_provider_disabled`, `quota_exceeded`, `internal_error`.
 
 ## Configuration
 
 See [.env.example](.env.example). Required secrets:
 
-- `SOCC_JWT_SECRET` — 32-byte hex HS256 secret shared with Vantage.
-- `SOCC_CREDENTIALS_MASTER_KEY` — 32-byte hex key for libsodium
-  secretbox. Rotating this invalidates every stored credential.
+- `SOCC_INTERNAL_SECRET` — 32-byte hex HS256 secret shared with Vantage.
+- `SOCC_MASTER_KEY` — 32-byte hex key for libsodium secretbox.
+  Rotating this invalidates every stored credential.
 
 Tunables:
 
+- `PORT` (default `7070`) — HTTP bind port.
 - `SESSION_TTL_MS` (default 15 min) — idle workers reaped after.
 - `MAX_CONCURRENT_SESSIONS` (default 50) — hard cap on live workers.
+- `TURN_TIMEOUT_MS` (default 90s) — per-turn generation timeout; on
+  expiry the worker aborts and the SSE stream emits
+  `error.retriable=true`.
+- `SOCC_ALLOW_LOCAL_PROVIDERS` (default `false`) — when `false`,
+  creating an `ollama` credential returns `local_provider_disabled`.
+- `LOG_LEVEL` (default `info`) — pino level.
 
-Per-user quota of 3 live sessions is hard-coded in `sessionManager.ts`
-per PRD.
+Per-user caps (PRD §Security):
+- 3 live sessions (hard-coded in `sessionManager.ts`).
+- 20 provider credentials (`MAX_CREDENTIALS_PER_USER` in
+  `credentials.ts`).
 
 ## Layout
 
@@ -128,9 +146,12 @@ src/
     index.ts              # Hono routes + SSE + bootstrap
     auth.ts               # JWT verifier (jose)
     credentials.ts        # Mongo + libsodium CRUD
+    providerTester.ts     # round-trips Anthropic/OpenAI/Gemini/Ollama
     streamAdapter.ts      # engine events → SoccStreamEvent projection
     workerPool.ts         # spawn / run / abort / shutdown
     sessionManager.ts     # userId↔sessionId↔worker + TTL + quotas
+    logger.ts             # pino with Authorization redaction
+    errors.ts             # PRD-reserved error code enum
     *.test.ts             # bun:test, no network
   types/
     socc-engine.d.ts      # ambient shim for @vantagesec/socc/engine
@@ -141,9 +162,12 @@ manifest.yaml             # consumed by Vantage's /extensions installer
 
 ## Install as a Vantage extension
 
-See [manifest.yaml](manifest.yaml). The extensions service reads this
-file, validates it against the v1 schema, and stands the container up
-via `docker-socket-proxy`. No host mounts, no install scripts.
+See [manifest.yaml](manifest.yaml) — the schema matches PRD
+§Extensions Platform so the `ExtensionManager` can consume it without
+translation. The extensions service validates the file, generates
+required secrets (`SOCC_MASTER_KEY`, `SOCC_INTERNAL_SECRET`) via
+`random_bytes_base64`, and stands the container up via
+`docker-socket-proxy`. No host mounts, no install scripts.
 
 ## Security notes
 
@@ -153,7 +177,10 @@ via `docker-socket-proxy`. No host mounts, no install scripts.
   touching Mongo — cross-tenant reads are impossible even with a leaked
   id.
 - `sid` in the JWT, when present, is enforced against `:id` in the URL.
-- SSE handler aborts the in-flight turn on client disconnect.
+- SSE handler aborts the in-flight turn on client disconnect and on the
+  90s generation timeout.
+- `Authorization` header is redacted to `[REDACTED]` in every pino log
+  line via `redact.paths`.
 
 ## License
 

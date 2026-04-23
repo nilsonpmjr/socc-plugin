@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test'
 import {
-  closeProjection,
   createStreamProjection,
   encodeSseEvent,
   type SoccStreamEvent,
@@ -8,8 +7,8 @@ import {
 
 describe('streamAdapter.createStreamProjection', () => {
   test('opens message, emits text delta, closes with content.done and message.end on next turn', () => {
-    const project = createStreamProjection()
-    const out1 = project({
+    const { step } = createStreamProjection()
+    const out1 = step({
       type: 'assistant',
       message: {
         id: 'msg_1',
@@ -20,9 +19,15 @@ describe('streamAdapter.createStreamProjection', () => {
     expect(out1.map((e) => e.type)).toEqual(['message.start', 'content.delta', 'content.done'])
     expect(out1[0]).toMatchObject({ type: 'message.start', messageId: 'msg_1' })
     expect(out1[1]).toMatchObject({ type: 'content.delta', text: 'hello world' })
+    expect(out1[2]).toMatchObject({
+      type: 'content.done',
+      messageId: 'msg_1',
+      content: 'hello world',
+      usage: null,
+    })
 
     // a new assistant turn closes the previous one
-    const out2 = project({
+    const out2 = step({
       type: 'assistant',
       message: {
         id: 'msg_2',
@@ -35,23 +40,40 @@ describe('streamAdapter.createStreamProjection', () => {
       'content.delta',
       'content.done',
     ])
-    expect(out2[0]).toMatchObject({ type: 'message.end', messageId: 'msg_1' })
+    expect(out2[0]).toMatchObject({ type: 'message.end', messageId: 'msg_1', stopReason: null })
   })
 
   test('streaming deltas emit content.delta without reopening the turn', () => {
-    const project = createStreamProjection()
-    project({ type: 'assistant', message: { id: 'msg_1', content: [] } })
+    const { step } = createStreamProjection()
+    step({ type: 'assistant', message: { id: 'msg_1', content: [] } })
 
-    const out = project({
+    const out = step({
       type: 'stream_event',
       event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'tok' } },
     })
     expect(out).toEqual([{ type: 'content.delta', messageId: 'msg_1', text: 'tok' }])
   })
 
+  test('message_delta stream_event captures stop_reason + usage for later content.done/message.end', () => {
+    const { step, finalize } = createStreamProjection()
+    step({ type: 'assistant', message: { id: 'msg_1', content: [] } })
+    step({
+      type: 'stream_event',
+      event: {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn' },
+        usage: { input_tokens: 12, output_tokens: 34 },
+      },
+    })
+    const finalEvents = finalize()
+    expect(finalEvents).toEqual([
+      { type: 'message.end', messageId: 'msg_1', stopReason: 'end_turn' },
+    ])
+  })
+
   test('tool_use opens tool.call.start; matching tool_result closes with ok=true', () => {
-    const project = createStreamProjection()
-    const open = project({
+    const { step } = createStreamProjection()
+    const open = step({
       type: 'assistant',
       message: {
         id: 'msg_1',
@@ -60,7 +82,7 @@ describe('streamAdapter.createStreamProjection', () => {
     })
     expect(open.some((e) => e.type === 'tool.call.start')).toBe(true)
 
-    const close = project({
+    const close = step({
       type: 'user',
       message: {
         content: [{ type: 'tool_result', tool_use_id: 'toolu_1', is_error: false }],
@@ -72,12 +94,12 @@ describe('streamAdapter.createStreamProjection', () => {
   })
 
   test('tool_result with is_error emits ok=false and carries the error content', () => {
-    const project = createStreamProjection()
-    project({
+    const { step } = createStreamProjection()
+    step({
       type: 'assistant',
       message: { id: 'msg_1', content: [{ type: 'tool_use', id: 't1', name: 'run' }] },
     })
-    const out = project({
+    const out = step({
       type: 'user',
       message: {
         content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'boom' }],
@@ -87,26 +109,31 @@ describe('streamAdapter.createStreamProjection', () => {
   })
 
   test('unknown event types are silently ignored', () => {
-    const project = createStreamProjection()
-    expect(project({ type: 'tombstone' } as never)).toEqual([])
-    expect(project({ type: 'request_start' } as never)).toEqual([])
-    expect(project({} as never)).toEqual([])
+    const { step } = createStreamProjection()
+    expect(step({ type: 'tombstone' } as never)).toEqual([])
+    expect(step({ type: 'request_start' } as never)).toEqual([])
+    expect(step({} as never)).toEqual([])
   })
 
   test('assistant message without a resolvable id is dropped', () => {
-    const project = createStreamProjection()
+    const { step } = createStreamProjection()
     expect(
-      project({ type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }),
+      step({ type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } }),
     ).toEqual([])
   })
 })
 
-describe('streamAdapter.closeProjection', () => {
-  test('emits message.end when a turn is still open', () => {
-    expect(closeProjection('msg_9')).toEqual([{ type: 'message.end', messageId: 'msg_9' }])
+describe('streamAdapter.finalize', () => {
+  test('emits message.end when a turn is still open; override wins', () => {
+    const { step, finalize } = createStreamProjection()
+    step({ type: 'assistant', message: { id: 'msg_9', content: [] } })
+    expect(finalize('aborted')).toEqual([
+      { type: 'message.end', messageId: 'msg_9', stopReason: 'aborted' },
+    ])
   })
   test('is a no-op when nothing is open', () => {
-    expect(closeProjection(null)).toEqual([])
+    const { finalize } = createStreamProjection()
+    expect(finalize()).toEqual([])
   })
 })
 
@@ -119,7 +146,7 @@ describe('streamAdapter.encodeSseEvent', () => {
     expect(out.endsWith('\n\n')).toBe(true)
   })
   test('includes id line when provided', () => {
-    const out = encodeSseEvent({ type: 'heartbeat' }, 42)
+    const out = encodeSseEvent({ type: 'heartbeat', ts: 1 }, 42)
     expect(out.startsWith('id: 42\n')).toBe(true)
   })
 })

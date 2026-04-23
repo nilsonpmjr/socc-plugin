@@ -1,7 +1,7 @@
 // Encrypted per-user LLM provider credentials, stored in MongoDB.
 //
 // Envelope: libsodium crypto_secretbox_easy (XSalsa20-Poly1305) with a
-// 32-byte master key from env (SOCC_CREDENTIALS_MASTER_KEY, hex-encoded).
+// 32-byte master key from env (SOCC_MASTER_KEY, hex-encoded).
 // Each credential gets a fresh 24-byte random nonce stored alongside the
 // ciphertext. The plaintext API key exists only transiently in memory
 // during an LLM call and is never cached.
@@ -68,6 +68,8 @@ type CredentialDoc = {
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096
 const MASTER_KEY_LENGTH = 32
+// PRD §Security — at most 20 provider credentials per user.
+export const MAX_CREDENTIALS_PER_USER = 20
 
 // Only the last 4 chars of the key are shown; prefix depends on provider
 // conventions but we don't parse — the user's raw prefix stays visible.
@@ -130,7 +132,7 @@ export class CredentialsStore {
     const key = Buffer.from(masterKeyHex, 'hex')
     if (key.length !== MASTER_KEY_LENGTH) {
       throw new Error(
-        `SOCC_CREDENTIALS_MASTER_KEY must be ${MASTER_KEY_LENGTH} bytes (${MASTER_KEY_LENGTH * 2} hex chars); got ${key.length} bytes`,
+        `SOCC_MASTER_KEY must be ${MASTER_KEY_LENGTH} bytes (${MASTER_KEY_LENGTH * 2} hex chars); got ${key.length} bytes`,
       )
     }
     await sodium.ready

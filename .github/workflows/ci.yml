@@ -90,8 +90,8 @@ jobs:
         run: |
           docker run --rm --name socc-ci \
             -e MONGO_URI=mongodb://nope:27017 \
-            -e SOCC_JWT_SECRET=$(openssl rand -hex 32) \
-            -e SOCC_CREDENTIALS_MASTER_KEY=$(openssl rand -hex 32) \
+            -e SOCC_INTERNAL_SECRET=$(openssl rand -hex 32) \
+            -e SOCC_MASTER_KEY=$(openssl rand -hex 32) \
             socc-plugin:ci 2>&1 | head -80 | tee /tmp/boot.log &
           sleep 8
           docker kill socc-ci 2>/dev/null || true

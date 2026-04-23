@@ -56,12 +56,13 @@ COPY --from=build /workspace/socc-plugin/node_modules/libsodium ./node_modules/l
 COPY --from=build /workspace/socc-plugin/node_modules/@vantagesec ./node_modules/@vantagesec
 
 USER socc
-EXPOSE 8787
+EXPOSE 7070
 ENV NODE_ENV=production
+ENV PORT=7070
 # Path to the bundled sessionWorker (read by src/server/workerPool.ts).
 ENV SOCC_WORKER_URL=file:///app/dist/sessionWorker.mjs
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8787/health | grep -q '"status":"ok"' || exit 1
+  CMD wget -qO- http://127.0.0.1:7070/v1/health | grep -q '"status":"ok"' || exit 1
 
 CMD ["bun", "run", "dist/server.mjs"]

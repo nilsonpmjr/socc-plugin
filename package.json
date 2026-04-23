@@ -19,6 +19,7 @@
     "jose": "5.9.6",
     "libsodium-wrappers": "0.7.15",
     "mongodb": "6.11.0",
+    "pino": "9.5.0",
     "ulid": "2.3.0",
     "zod": "3.25.76"
   },

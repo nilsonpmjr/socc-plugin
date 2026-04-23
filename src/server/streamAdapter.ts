@@ -19,11 +19,32 @@
 //   heartbeat       — periodic no-op for proxy keepalive (emitted by
 //                     the server loop, not here)
 
+export type SoccUsage = {
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+}
+
+export type SoccStopReason =
+  | 'end_turn'
+  | 'max_tokens'
+  | 'stop_sequence'
+  | 'tool_use'
+  | 'error'
+  | 'aborted'
+  | null
+
 export type SoccStreamEvent =
   | { type: 'session.ready'; sessionId: string }
   | { type: 'message.start'; messageId: string }
   | { type: 'content.delta'; messageId: string; text: string }
-  | { type: 'content.done'; messageId: string }
+  | {
+      type: 'content.done'
+      messageId: string
+      content: string
+      usage: SoccUsage | null
+    }
   | {
       type: 'tool.call.start'
       messageId: string
@@ -37,9 +58,9 @@ export type SoccStreamEvent =
       ok: boolean
       errorMessage?: string
     }
-  | { type: 'message.end'; messageId: string }
-  | { type: 'error'; message: string; retriable: boolean }
-  | { type: 'heartbeat' }
+  | { type: 'message.end'; messageId: string; stopReason: SoccStopReason }
+  | { type: 'error'; code?: string; message: string; retriable: boolean }
+  | { type: 'heartbeat'; ts: number }
 
 // Minimal shapes we need to discriminate on. We treat these as
 // structural contracts; anything extra on the real object is ignored.
@@ -67,11 +88,24 @@ type RawAssistantMessage = {
 
 type RawStreamTextDelta = {
   type: 'stream_event'
-  event?: {
-    type: 'content_block_delta'
-    index?: number
-    delta?: { type: 'text_delta'; text: string } | { type: string }
-  }
+  event?:
+    | {
+        type: 'content_block_delta'
+        index?: number
+        delta?: { type: 'text_delta'; text: string } | { type: string }
+      }
+    | {
+        type: 'message_delta'
+        delta?: { stop_reason?: string | null }
+        usage?: {
+          input_tokens?: number
+          output_tokens?: number
+          cache_read_input_tokens?: number
+          cache_creation_input_tokens?: number
+        }
+      }
+    | { type: 'message_stop' }
+    | { type: string }
   messageId?: string
 }
 
@@ -105,22 +139,54 @@ function extractStreamMessageId(ev: RawStreamTextDelta): string | null {
   return ev.messageId ?? null
 }
 
+type MessageState = {
+  content: string
+  usage: SoccUsage | null
+  stopReason: SoccStopReason
+}
+
+function normalizeStopReason(raw: string | null | undefined): SoccStopReason {
+  if (raw === null || raw === undefined) return null
+  switch (raw) {
+    case 'end_turn':
+    case 'max_tokens':
+    case 'stop_sequence':
+    case 'tool_use':
+      return raw
+    default:
+      return null
+  }
+}
+
+export type StreamProjection = {
+  step: (ev: RawEvent) => SoccStreamEvent[]
+  // Emits a trailing message.end if a turn is still open. Used when the
+  // engine generator returns without a message_delta/stop event, or when
+  // the worker is aborted mid-stream. Callers may pass `overrideStopReason`
+  // to override (e.g. 'aborted' on client disconnect, 'error' on upstream
+  // failure); otherwise the projection uses whatever it collected.
+  finalize: (overrideStopReason?: SoccStopReason) => SoccStreamEvent[]
+  getCurrentMessageId: () => string | null
+}
+
 // Drives the full lifecycle: translates each engine yield into zero or
 // more SoccStreamEvents. State is kept in a closure so we can emit
 // message.start/message.end once per logical assistant turn.
-export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
+export function createStreamProjection(): StreamProjection {
   let currentMessageId: string | null = null
   const openToolCalls = new Set<string>()
+  const messageState = new Map<string, MessageState>()
 
-  function emitMessageEndIfNeeded(): SoccStreamEvent[] {
-    if (!currentMessageId) return []
-    const out: SoccStreamEvent[] = [{ type: 'message.end', messageId: currentMessageId }]
-    currentMessageId = null
-    openToolCalls.clear()
-    return out
+  function stateFor(mid: string): MessageState {
+    let st = messageState.get(mid)
+    if (!st) {
+      st = { content: '', usage: null, stopReason: null }
+      messageState.set(mid, st)
+    }
+    return st
   }
 
-  return (ev: RawEvent): SoccStreamEvent[] => {
+  const step = (ev: RawEvent): SoccStreamEvent[] => {
     const kind = (ev as { type?: string }).type
 
     // Assistant message (final or in-progress). The engine emits one of
@@ -133,7 +199,12 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
       const out: SoccStreamEvent[] = []
       // If a previous turn never closed, close it before opening a new one.
       if (currentMessageId && currentMessageId !== mid) {
-        out.push({ type: 'message.end', messageId: currentMessageId })
+        const prev = stateFor(currentMessageId)
+        out.push({
+          type: 'message.end',
+          messageId: currentMessageId,
+          stopReason: prev.stopReason,
+        })
         openToolCalls.clear()
       }
       if (currentMessageId !== mid) {
@@ -141,9 +212,11 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
         currentMessageId = mid
       }
 
+      const st = stateFor(mid)
       const content = am.message?.content ?? am.content ?? []
       if (typeof content === 'string') {
         if (content.length > 0) {
+          st.content += content
           out.push({ type: 'content.delta', messageId: mid, text: content })
         }
       } else {
@@ -151,6 +224,7 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
           if (block.type === 'text') {
             const t = (block as RawAssistantText).text
             if (t && t.length > 0) {
+              st.content += t
               out.push({ type: 'content.delta', messageId: mid, text: t })
             }
           } else if (block.type === 'tool_use') {
@@ -166,8 +240,13 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
         }
       }
       // Completed text block in a final assistant message; emit content.done
-      // so clients can finalize their rendering.
-      out.push({ type: 'content.done', messageId: mid })
+      // with the aggregated text and any usage we've already picked up.
+      out.push({
+        type: 'content.done',
+        messageId: mid,
+        content: st.content,
+        usage: st.usage,
+      })
       return out
     }
 
@@ -179,16 +258,43 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
       const se = ev as RawStreamTextDelta
       const mid = extractStreamMessageId(se) ?? currentMessageId
       if (!mid) return []
-      const delta = se.event?.delta
-      if (
-        se.event?.type === 'content_block_delta' &&
-        delta &&
-        (delta as { type: string }).type === 'text_delta'
-      ) {
-        const text = (delta as { text?: string }).text ?? ''
-        if (text.length > 0) {
-          return [{ type: 'content.delta', messageId: mid, text }]
+      const evType = se.event?.type
+      if (evType === 'content_block_delta') {
+        const delta = (se.event as { delta?: unknown }).delta as
+          | { type: string; text?: string }
+          | undefined
+        if (delta?.type === 'text_delta') {
+          const text = delta.text ?? ''
+          if (text.length > 0) {
+            stateFor(mid).content += text
+            return [{ type: 'content.delta', messageId: mid, text }]
+          }
         }
+        return []
+      }
+      // Anthropic-style terminal metadata: carries stop_reason + usage.
+      if (evType === 'message_delta') {
+        const md = se.event as {
+          delta?: { stop_reason?: string | null }
+          usage?: {
+            input_tokens?: number
+            output_tokens?: number
+            cache_read_input_tokens?: number
+            cache_creation_input_tokens?: number
+          }
+        }
+        const st = stateFor(mid)
+        const sr = normalizeStopReason(md.delta?.stop_reason)
+        if (sr) st.stopReason = sr
+        if (md.usage) {
+          st.usage = {
+            inputTokens: md.usage.input_tokens,
+            outputTokens: md.usage.output_tokens,
+            cacheReadInputTokens: md.usage.cache_read_input_tokens,
+            cacheCreationInputTokens: md.usage.cache_creation_input_tokens,
+          }
+        }
+        return []
       }
       return []
     }
@@ -233,13 +339,28 @@ export function createStreamProjection(): (ev: RawEvent) => SoccStreamEvent[] {
     // Explicitly ignored — we don't forward internals to clients.
     return []
   }
-}
 
-// Terminal event: emit message.end if a turn is still open. Used when
-// the generator returns (terminal) or the worker is aborted mid-stream.
-export function closeProjection(currentMessageId: string | null): SoccStreamEvent[] {
-  if (!currentMessageId) return []
-  return [{ type: 'message.end', messageId: currentMessageId }]
+  const finalize = (overrideStopReason?: SoccStopReason): SoccStreamEvent[] => {
+    if (!currentMessageId) return []
+    const mid = currentMessageId
+    const st = stateFor(mid)
+    const out: SoccStreamEvent[] = [
+      {
+        type: 'message.end',
+        messageId: mid,
+        stopReason: overrideStopReason ?? st.stopReason,
+      },
+    ]
+    currentMessageId = null
+    openToolCalls.clear()
+    return out
+  }
+
+  return {
+    step,
+    finalize,
+    getCurrentMessageId: () => currentMessageId,
+  }
 }
 
 // SSE wire encoding. Single event per call; `id` is optional but useful
