@@ -24,32 +24,34 @@ Itens marcados `[x]` estão concluídos; os demais seguem a ordem do PRD.
 - [x] Smoke do REPL original continua passando (`--version`, CLI).
 
 ### Plugin (`socc-plugin` sob `nilsonpmjr/`)
-- [x] `package.json` com `file:../socc` durante dev; deps: `hono`, `jose`, `libsodium-wrappers`, `mongodb`, `ulid`, `zod` (`pino` ainda não — ver débito em FOLLOWUP).
+- [x] `package.json` com `file:../socc` durante dev; deps: `hono`, `jose`, `libsodium-wrappers`, `mongodb`, `pino`, `ulid`, `zod`.
 - [x] `src/sessionWorker.ts` — Bun Worker body, 1 sessão = 1 Worker (não compartilha STATE).
 - [x] `src/server/workerPool.ts` — spawn/run/abort/shutdown; limite `maxConcurrent`; respawn em crash.
 - [x] `src/server/sessionManager.ts` — quota 3 sessões/usuário (PRD §Security); ownership scoping; TTL sweep; cross-tenant impossível por design.
-- [x] `src/server/credentials.ts` — libsodium `crypto_secretbox_easy` (XSalsa20-Poly1305), nonce 24B, master key 32B via env. Plaintext nunca em log/response.
-- [x] `src/server/auth.ts` — JWT HS256 scope=socc, iss=vantage, aud=socc-plugin, TTL≤60s; `claims.sub` obrigatório; `claims.sid` opcional.
-- [x] `src/server/streamAdapter.ts` — projeção de `query()` events para `SoccStreamEvent`.
-- [x] `src/server/index.ts` — Hono + SSE em `:8787`: `/health`, `/credentials` CRUD, `/sessions` CRUD, `/sessions/:id/turns`, `/sessions/:id/abort`. Heartbeat 15s. Graceful shutdown (SIGINT/SIGTERM).
-- [x] 52 testes unitários (typecheck limpo).
-- [x] `Dockerfile` multi-stage, non-root, healthcheck, bundle `server.mjs` + `sessionWorker.mjs`.
-- [x] `compose.yml` com `socc-mongo` isolado (critério PRD §Integration Points).
-- [x] `manifest.yaml` schema `vantage.extensions/v1` (manifest real do PRD §Extensions Platform ainda precisa reconciliação — ver débito).
-- [x] `.env.example`, `.dockerignore`, `README.md`, `.github/workflows/ci.yml` (typecheck + test + docker build + smoke boot).
+- [x] `src/server/credentials.ts` — libsodium `crypto_secretbox_easy` (XSalsa20-Poly1305), nonce 24B, master key 32B via env (`SOCC_MASTER_KEY`). Plaintext nunca em log/response. Max 20 creds/user via `MAX_CREDENTIALS_PER_USER`.
+- [x] `src/server/auth.ts` — JWT HS256 scope=socc, iss=vantage, aud=socc-plugin, TTL≤60s; `claims.sub` obrigatório; `claims.sid` opcional; secret via `SOCC_INTERNAL_SECRET`.
+- [x] `src/server/streamAdapter.ts` — projeção de `query()` events para `SoccStreamEvent` com `content.done{content,usage}`, `message.end{stopReason}`, `heartbeat{ts}` completos. Retorna `{step, finalize, getCurrentMessageId}`.
+- [x] `src/server/providerTester.ts` — round-trip Anthropic/OpenAI/Gemini/Ollama, classifica 200/401/400-404/rede; usado pela rota `/v1/credentials/:id/test`.
+- [x] `src/server/logger.ts` — pino JSON estruturado com redact em `Authorization` + `apiKey`.
+- [x] `src/server/errors.ts` — constantes dos 10 códigos reservados do PRD §Security.
+- [x] `src/server/index.ts` — Hono + SSE em `:7070` sob `/v1/*`:
+  - [x] `/v1/health` (público), `/v1/credentials` CRUD + `/v1/credentials/:id/test`.
+  - [x] `/v1/session` (singular) CRUD + `/v1/session/:id/message` (PRD) + `/v1/session/:id/turns` (alias) + `/v1/session/:id/abort`.
+  - [x] Heartbeat 15s com `ts`. Graceful shutdown (SIGINT/SIGTERM).
+  - [x] Timeout 90s por turn → SSE `error.code=provider_unavailable retriable=true` + aborta worker.
+  - [x] Flag `SOCC_ALLOW_LOCAL_PROVIDERS` (default `false`) → rejeita `provider=ollama` com `local_provider_disabled`.
+  - [x] Cross-user = 404 (`session_not_found`); sid mismatch = 403 (`session_forbidden`).
+- [x] 58 testes unitários (typecheck limpo, 125 expect() calls).
+- [x] `Dockerfile` multi-stage, non-root, healthcheck `/v1/health`, bundle `server.mjs` + `sessionWorker.mjs`.
+- [x] `compose.yml` com `socc-mongo` isolado, env vars e healthcheck alinhados com PRD.
+- [x] `manifest.yaml` no schema **exato** do PRD §Extensions Platform (id, compose_file, operations, health, secrets, requires, settings, uninstall).
+- [x] `.env.example`, `.dockerignore`, `README.md`, `.github/workflows/ci.yml` (typecheck + test + docker build + smoke boot) atualizados.
 - [x] Smoke real: `docker compose up` + curl autenticado → credential cifrada → sessão → Worker real carrega `@vantagesec/socc/engine` → `activeSessions` reflete → DELETE libera slot.
 
-### Débito conhecido desta fase (ver FOLLOWUP §Débito técnico)
-- [ ] Renomear `SOCC_JWT_SECRET` → `SOCC_INTERNAL_SECRET` (nome do PRD §Security).
-- [ ] Renomear `SOCC_CREDENTIALS_MASTER_KEY` → `SOCC_MASTER_KEY` (nome do PRD §Security).
-- [ ] `SoccStreamEvent` no PRD inclui `session.ready`, `content.done{content,usage}`, `message.end{stop_reason}`, `heartbeat{ts}`. Hoje emitimos sem `usage`/`stop_reason`/`ts`. Reconciliar contrato.
-- [ ] `POST /credentials/:id/test` — US-1 exige que o save só persista se o teste de provider retornar `ok: true`. Hoje existe `recordTestResult` na store mas não existe a rota.
-- [ ] Flag `SOCC_ALLOW_LOCAL_PROVIDERS` (default `false`) — rejeitar `provider=ollama` com `local_provider_disabled` se flag desligada. Não implementado.
-- [ ] `pino` logging JSON estruturado (PRD §Dependencies). Hoje usamos `console.log`.
-- [ ] Binding HTTP no PRD é `:7070`; hoje servimos em `:8787`. Decidir canonicidade e alinhar manifest + compose + docs.
-- [ ] Max 20 provider credentials por usuário (PRD §Security). Hoje sem limite.
-- [ ] Timeout de geração 90s → SSE emite `error.retriable=true` + aborta (PRD §Security). Hoje sem timeout explícito.
+### Débito pendente (hardening antes de v1.0)
 - [ ] `SOCC_WORKER_URL` é workaround do bundling; ideal é layout que resolve via `import.meta.url` sem env var.
+- [ ] Publicar `@vantagesec/socc` no npm → remover `file:../socc`.
+- [ ] Teste multi-sessão concorrente (cobrado pelo PRD como mitigação do risco "Alta/Crítico"; ver Fase 1).
 
 ---
 
@@ -78,20 +80,20 @@ cross-user retorna 404."
 - [ ] `backend/routers/socc.py` com proxy autenticado:
   - [ ] `POST /api/socc/providers` → encaminha ao plugin após mintagem de JWT.
   - [ ] `GET /api/socc/providers` / `DELETE /api/socc/providers/:id`.
-  - [ ] `POST /api/socc/providers/:id/test` — US-1 AC: bloqueia save se `ok: false`.
-  - [ ] `POST /api/socc/session` → plugin `/sessions`.
+  - [ ] `POST /api/socc/providers/:id/test` — US-1 AC: bloqueia save se `ok: false` (plugin já expõe `/v1/credentials/:id/test`).
+  - [ ] `POST /api/socc/session` → plugin `/v1/session`.
   - [ ] `GET /api/socc/session/:id/stream` — proxy SSE bidirecional.
-  - [ ] `POST /api/socc/session/:id/message` → plugin `/sessions/:id/turns`.
-  - [ ] `POST /api/socc/session/:id/abort` → plugin `/sessions/:id/abort`.
+  - [ ] `POST /api/socc/session/:id/message` → plugin `/v1/session/:id/message`.
+  - [ ] `POST /api/socc/session/:id/abort` → plugin `/v1/session/:id/abort`.
 - [ ] Mintagem JWT interno `{sub: user_id, scope: "socc", sid: session_id, exp: now+60s}` assinado com `SOCC_INTERNAL_SECRET`.
 - [ ] Middleware redacta `Authorization` em logs (PRD §Technical Risks — vaza em logs = crítico).
 - [ ] Rate limit (PRD §Security):
   - [ ] 20 msgs/min por usuário (via `limiters.py`).
   - [ ] Máx 3 sessões ativas/usuário.
-  - [ ] Máx 20 provider credentials/usuário.
+  - [ ] Máx 20 provider credentials/usuário (plugin já enforce; ecoar no backend p/ UX).
   - [ ] Max output tokens configurável por credential (default 4096).
 - [ ] Resposta **404** (não 403) para session alheia — não vaza existência.
-- [ ] Flag `SOCC_ALLOW_LOCAL_PROVIDERS` (env do backend) — rejeita provider `ollama` com erro `local_provider_disabled` se `false`.
+- [ ] Flag `SOCC_ALLOW_LOCAL_PROVIDERS` (env do backend) — rejeita provider `ollama` com erro `local_provider_disabled` se `false` (plugin também enforce).
 - [ ] Audit log em `audit.py` com eventos:
   - [ ] `socc_provider_created`, `socc_provider_revoked`, `socc_provider_tested`.
   - [ ] `socc_session_started`, `socc_session_ended`.
@@ -170,7 +172,7 @@ uninstall destrói volume por default; audit log de todas as ops; socket nunca m
 - [ ] Reconciliação no boot — lê `extensions_state`, verifica containers, corrige divergências.
 
 ### Manifest do SOC Copilot
-- [ ] `backend/extensions/socc/manifest.yaml` **idêntico ao exemplo do PRD §Extensions Platform** (não o que escrevi em `manifest.yaml` hoje — reconciliar).
+- [x] `socc-plugin/manifest.yaml` **idêntico ao schema do PRD §Extensions Platform** (reconciliado em 2026-04-24). Quando for copiado para `backend/extensions/socc/manifest.yaml`, é cópia direta.
 - [ ] `backend/extensions/socc/compose.yml` — `socc-copilot` + `socc-mongo`, profile-less (runs via manager).
 
 ### Frontend `/extensions`
@@ -199,7 +201,7 @@ uninstall destrói volume por default; audit log de todas as ops; socket nunca m
   - [ ] `search_incidents(date_range?, severity?)` → `/api/stats`
   - [ ] `get_system_health()` → `/api/admin/system-health` (admin only)
 - [ ] `canUseTool` substituído por policy real no plugin (hoje: deny-all).
-- [ ] SSE emite `tool.call.start` e `tool.call.done` (PRD §Security SoccStreamEvent).
+- [ ] SSE emite `tool.call.start` e `tool.call.done` (PRD §Security). Nota: plugin hoje emite `tool.call.end` — decidir paridade de nome antes de Fase 5.
 - [ ] Histórico persistente em `socc_messages` do `socc-mongo` — TTL 30 dias default (PRD §LGPD).
 - [ ] Rename / pin / export de sessão na UI.
 - [ ] Eval: 50 perguntas golden com tools esperadas → precision@1 ≥ 85%.
