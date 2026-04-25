@@ -108,6 +108,8 @@ function makePool(yielder?: (init: { sessionId: string; turnId: string; text: st
   const calls: PoolCalls = { spawn: [], run: [], abort: [], shutdown: [] }
   const produce =
     yielder ?? (() => [{ kind: 'end', reason: 'complete' }] as TurnEvent[])
+  let onDied: ((ev: { sessionId: string; reason: string; message: string }) => void) | null =
+    null
   const pool = {
     spawn: async (init: SessionInit) => void calls.spawn.push(init),
     run: async function* (sessionId: string, turnId: string, text: string) {
@@ -121,7 +123,18 @@ function makePool(yielder?: (init: { sessionId: string; turnId: string; text: st
     shutdownAll: () => {},
     has: () => false,
     size: () => 0,
-  } as unknown as WorkerPool
+    setOnWorkerDied: (h: typeof onDied) => {
+      const prev = onDied
+      onDied = h
+      return prev
+    },
+    // Test helper — lets tests simulate a Worker crash.
+    __fireDied: (sessionId: string, reason = 'crash', message = 'simulated crash') => {
+      onDied?.({ sessionId, reason, message })
+    },
+  } as unknown as WorkerPool & {
+    __fireDied: (sessionId: string, reason?: string, message?: string) => void
+  }
   return { pool, calls }
 }
 

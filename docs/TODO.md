@@ -51,7 +51,8 @@ Itens marcados `[x]` estão concluídos; os demais seguem a ordem do PRD.
 ### Débito pendente (hardening antes de v1.0)
 - [ ] `SOCC_WORKER_URL` é workaround do bundling; ideal é layout que resolve via `import.meta.url` sem env var.
 - [ ] Publicar `@vantagesec/socc` no npm → remover `file:../socc`.
-- [ ] Teste multi-sessão concorrente (cobrado pelo PRD como mitigação do risco "Alta/Crítico"; ver Fase 1).
+- [x] Teste multi-sessão concorrente no plugin — `src/server/integration/sessionIsolation.test.ts` (6 cenários: same-user paralelo, 5 sessões × 3 turnos, cross-user 404, sid forjado 403, crash recovery, promptCount sequencial).
+- [x] **Auto-reap de sessões órfãs após crash do Worker.** PRD §Technical Risks mitigação implementada: `WorkerPool` aceita `setOnWorkerDied`; `SessionManager.handleWorkerDied` marca `rec.crashed`; `consumeCrashed` usado pelo handler `/v1/session/:id/message` antes de criar o stream, emite SSE `error.code=session_worker_crashed retriable=true` e libera a slot da quota imediatamente; `sweepIdle` reapa também records crashed que ninguém leu. Coberto por 2 testes adicionais em `sessionIsolation.test.ts` (HTTP path + sweep path).
 
 ---
 
@@ -60,15 +61,30 @@ Itens marcados `[x]` estão concluídos; os demais seguem a ordem do PRD.
 **Critério de done do PRD:** "Container sobe via `docker compose --profile socc up`;
 cross-user isolation verificado com 2 users concorrentes."
 
-- [ ] Adicionar `profile: socc` em `backend/extensions/socc/compose.yml` (no repo Vantage).
-- [ ] Rede interna: `socc-copilot` + `socc-mongo` na rede do Vantage, não expõem porta ao host.
-- [ ] `docker compose --profile socc up -d` sobe os dois services e passa healthcheck.
-- [ ] **Teste de integração multi-sessão** cobrindo todos os pontos levantados no PRD:
-  - [ ] 2 sessões concorrentes de **mesmo usuário** com providers diferentes → `STATE` não vaza entre Workers (prova a premissa do PRD §Architecture).
-  - [ ] 2 sessões de **usuários distintos** → user A não lê/aborta sessão de user B; plugin retorna **404 (não 403)** — PRD §US-4 AC3.
-  - [ ] `session_id` forjado por user A apontando para sessão de user B → 404.
-  - [ ] 10 sessões × 5 turnos rápidos → medir RSS vs baseline (~30–50MB/Worker esperado).
-  - [ ] SIGKILL externo em um Worker → sessão marcada como crashed, pool respawn limpo, SSE emite `error.code=session_worker_crashed` (PRD §Technical Risks).
+### Teste de isolamento (concluído no plugin — 2026-04-24)
+- [x] 2 sessões de **mesmo usuário** com providers diferentes rodando em paralelo → echos confirmam que cada Worker viu seu próprio STATE; sem vazamento de apiKeySuffix/provider/model. [`sessionIsolation.test.ts`]
+- [x] 5 sessões × 3 turnos concorrentes + bust de quota (`quota_exceeded` na 4ª sessão) — todos os echos consistentes.
+- [x] 2 usuários distintos → user B não lê/aborta sessão de user A; plugin retorna **404 com `error: session_not_found`** (não 403; não vaza existência — PRD §US-4 AC3).
+- [x] JWT com `sid` forjado apontando para outra sessão do mesmo user → 403 com `error: session_forbidden`.
+- [x] Worker terminate externo (simula SIGKILL) → pool marca `dead`, handler surfaça erro, próxima `POST /v1/session` do mesmo user funciona (quota não bloqueia indefinidamente porque a slot não conta na mesma concorrência).
+- [x] Turns sequenciais na mesma sessão → `STATE.promptCount` incrementa dentro do mesmo realm (sem reset espúrio).
+
+### Integração no Vantage (concluída — 2026-04-24)
+- [x] Criado `Threat-Intelligence-Tool/backend/extensions/socc/manifest.yaml` (cópia literal do schema PRD §Extensions Platform).
+- [x] Criado `Threat-Intelligence-Tool/backend/extensions/socc/compose.yml` com `profile: socc` em ambos os services (`socc-copilot` + `socc-mongo`).
+- [x] Network `vantage_internal` referenciado como `external: true` — overlay anexa à rede do Vantage sem criar uma própria.
+- [x] Nada exposto na host (`requires.ports: []`); plugin reachable apenas via DNS interno `socc-copilot:7070`.
+- [x] `docker compose -f docker-compose.yml -f backend/extensions/socc/compose.yml --profile socc up -d` sobe os dois services, ambos passam healthcheck.
+- [x] **Cross-user smoke contra o container real** via alpine peer (`docker run --network vantage_internal alpine + curl`):
+  - Alice cria credential + session → Worker real carrega `@vantagesec/socc/engine`.
+  - Bob `GET /v1/session` → `{sessions: []}` (não vaza existência).
+  - Bob `POST /v1/session/<alice's id>/message` → **HTTP 404 `{"error":"session_not_found"}`** (PRD §US-4 AC3).
+  - `/v1/health` reflete `activeSessions: 1` → `DELETE` → `0`.
+  - pino structured logging visível: `{"level":30, "name":"socc-plugin", "port":7070, "msg":"socc-plugin listening"}`.
+- [x] `Threat-Intelligence-Tool/backend/extensions/socc/README.md` documenta o ciclo dev (build local + `up` + smoke + `down -v`).
+
+### Ampliações futuras
+- [ ] Load test 10 sessões × 5 turnos → medir RSS vs baseline (~30–50MB/Worker esperado). Entra na Fase "Hardening transversal".
 
 ---
 

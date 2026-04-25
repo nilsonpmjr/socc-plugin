@@ -26,12 +26,39 @@ export type TurnEvent =
   | { kind: 'engine'; event: unknown }
   | { kind: 'end'; reason: 'complete' | 'aborted' | 'error'; errorMessage?: string }
 
+// Notification fired when a Worker becomes unusable (crash, internal
+// terminate, or fatal init failure). The pool DOES NOT auto-remove the
+// dead slot from its index — callers (sessionManager) decide whether to
+// clean up immediately or keep it for retry.
+export type WorkerDiedEvent = {
+  sessionId: string
+  reason: 'crash' | 'terminated' | 'init_failed'
+  message: string
+}
+
 export class WorkerPool {
   private readonly workers = new Map<string, WorkerSlot>()
   private readonly maxConcurrent: number
+  private onWorkerDied: ((ev: WorkerDiedEvent) => void) | null
 
-  constructor(options: { maxConcurrent: number }) {
+  constructor(options: {
+    maxConcurrent: number
+    onWorkerDied?: (ev: WorkerDiedEvent) => void
+  }) {
     this.maxConcurrent = options.maxConcurrent
+    this.onWorkerDied = options.onWorkerDied ?? null
+  }
+
+  // Subscribe to worker-died events post-construction. Last writer wins;
+  // we don't fan-out because there's exactly one logical owner
+  // (sessionManager). Returns the previous handler if any (handy for
+  // tests that want to chain).
+  setOnWorkerDied(
+    handler: ((ev: WorkerDiedEvent) => void) | null,
+  ): ((ev: WorkerDiedEvent) => void) | null {
+    const prev = this.onWorkerDied
+    this.onWorkerDied = handler
+    return prev
   }
 
   has(sessionId: string): boolean {
@@ -55,7 +82,13 @@ export class WorkerPool {
       )
     }
 
-    const slot = new WorkerSlot(init)
+    const slot = new WorkerSlot(init, (reason, message) => {
+      // Only fire once per slot; subsequent terminate/onFatal calls are
+      // a no-op so callers can safely cascade them.
+      if (this.onWorkerDied) {
+        this.onWorkerDied({ sessionId: init.sessionId, reason, message })
+      }
+    })
     this.workers.set(init.sessionId, slot)
     try {
       await slot.ready()
@@ -112,6 +145,14 @@ class WorkerSlot {
   private readyPromise: Promise<void>
   private resolveReady!: () => void
   private rejectReady!: (err: Error) => void
+  private readonly notifyDied: (
+    reason: 'crash' | 'terminated' | 'init_failed',
+    message: string,
+  ) => void
+  // True after notifyDied has fired once — the pool's onWorkerDied
+  // callback is at-most-once per slot. This matters because both the
+  // worker's `error` event and an explicit terminate() can race.
+  private diedNotified = false
   // Current turn plumbing. Only one turn is in flight at a time; the
   // Worker enforces this too, but gating at the slot saves a round trip.
   private turn: {
@@ -122,8 +163,15 @@ class WorkerSlot {
   } | null = null
   dead = false
 
-  constructor(init: SessionInit) {
+  constructor(
+    init: SessionInit,
+    notifyDied: (
+      reason: 'crash' | 'terminated' | 'init_failed',
+      message: string,
+    ) => void,
+  ) {
     this.sessionId = init.sessionId
+    this.notifyDied = notifyDied
     // In dev, the worker source sits at ../sessionWorker.ts. When the
     // server is bundled for prod, bun emits ../sessionWorker.mjs next to
     // the main bundle; SOCC_WORKER_URL lets the container point at it.
@@ -239,20 +287,39 @@ class WorkerSlot {
   }
 
   private onFatal(message: string): void {
+    const wasReady = this.dead === false && this.diedNotified === false
     this.dead = true
     if (this.turn) {
       this.pushTurn(this.turn.id, { kind: 'end', reason: 'error', errorMessage: message })
       this.closeTurn(this.turn.id)
     }
     this.rejectReady(new Error(message))
+    if (wasReady) this.fireDied('crash', message)
   }
 
+  // Called either by graceful shutdown (pool.shutdown) or by tests
+  // simulating SIGKILL. Idempotent at the notifyDied level.
   terminate(): void {
+    const firstCall = !this.dead && !this.diedNotified
     this.dead = true
     try {
       this.worker.terminate()
     } catch {
       // worker may already be gone; ignore
+    }
+    if (firstCall) this.fireDied('terminated', 'worker terminated')
+  }
+
+  private fireDied(
+    reason: 'crash' | 'terminated' | 'init_failed',
+    message: string,
+  ): void {
+    if (this.diedNotified) return
+    this.diedNotified = true
+    try {
+      this.notifyDied(reason, message)
+    } catch {
+      // Listener errors must not poison slot teardown.
     }
   }
 }

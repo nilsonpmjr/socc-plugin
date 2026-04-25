@@ -45,9 +45,17 @@ jobs:
         working-directory: socc-plugin
         run: bun run typecheck
 
-      - name: Test
+      # Split unit and integration tests into separate runs. The Bun
+      # 1.3.12 runtime occasionally crashes when many Workers are spun
+      # up across files in a single process; running them in two passes
+      # avoids that flake.
+      - name: Test (unit)
         working-directory: socc-plugin
-        run: bun test
+        run: bun run test:unit
+
+      - name: Test (integration)
+        working-directory: socc-plugin
+        run: bun run test:integration
 
   docker:
     name: docker build

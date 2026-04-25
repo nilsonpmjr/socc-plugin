@@ -10,7 +10,9 @@
     "start": "bun run src/server/index.ts",
     "build": "bun build src/server/index.ts --target=bun --outfile=dist/server.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:unit": "bun test src/server/auth.test.ts src/server/credentials.test.ts src/server/streamAdapter.test.ts src/server/sessionManager.test.ts src/server/index.test.ts",
+    "test:integration": "bun test src/server/integration/"
   },
   "dependencies": {
     "@hono/node-server": "1.13.8",

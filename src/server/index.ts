@@ -286,6 +286,24 @@ export function buildApp(deps: AppDeps): Hono<{ Variables: AppVariables }> {
         return c.json({ error: ERR.SessionNotFound }, 404)
       }
 
+      // PRD §Technical Risks mitigation: if the underlying Worker died
+      // (crash / external terminate / failed init), surface a clean SSE
+      // error frame and reap the slot so the user's quota frees up
+      // immediately — frontend prompts a "restart session".
+      const crashed = deps.sessions.consumeCrashed(userId, sessionId)
+      if (crashed) {
+        const body = makeCrashedSseStream(crashed.message)
+        return new Response(body, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          },
+        })
+      }
+
       const body = streamTurnResponse(
         deps.sessions,
         userId,
@@ -307,6 +325,30 @@ export function buildApp(deps: AppDeps): Hono<{ Variables: AppVariables }> {
   }
 
   return app
+}
+
+// Single-frame SSE stream emitted when the user hits an already-dead
+// session (PRD §Technical Risks: "session_worker_crashed"). The client
+// is expected to recreate the session — we mark `retriable: true` so
+// the frontend can show a "Restart session" CTA instead of a hard
+// failure.
+function makeCrashedSseStream(message: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const ev: SoccStreamEvent = {
+        type: 'error',
+        // session_worker_crashed isn't in the original PRD reserved set
+        // but the PRD §Technical Risks row that defines this mitigation
+        // explicitly names this code. Kept narrow on purpose.
+        code: 'session_worker_crashed',
+        message,
+        retriable: true,
+      }
+      controller.enqueue(encoder.encode(encodeSseEvent(ev, 1)))
+      controller.close()
+    },
+  })
 }
 
 // Builds the SSE ReadableStream for a turn. Owns the projection state

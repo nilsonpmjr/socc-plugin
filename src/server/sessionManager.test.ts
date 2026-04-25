@@ -61,6 +61,8 @@ function makePool(options: {
   }
   const yieldsFor =
     options.runYields ?? (() => [{ kind: 'end', reason: 'complete' }] as TurnEvent[])
+  let onDied: ((ev: { sessionId: string; reason: string; message: string }) => void) | null =
+    null
   const pool = {
     spawn: async (init: SessionInit) => {
       if (options.capacityError) throw options.capacityError
@@ -81,7 +83,17 @@ function makePool(options: {
     },
     has: (_sid: string) => false,
     size: () => 0,
-  } as unknown as WorkerPool
+    setOnWorkerDied: (h: typeof onDied) => {
+      const prev = onDied
+      onDied = h
+      return prev
+    },
+    __fireDied: (sessionId: string, reason = 'crash', message = 'simulated') => {
+      onDied?.({ sessionId, reason, message })
+    },
+  } as unknown as WorkerPool & {
+    __fireDied: (sessionId: string, reason?: string, message?: string) => void
+  }
   return { pool, calls }
 }
 

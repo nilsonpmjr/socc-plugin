@@ -56,6 +56,11 @@ export type CreateSessionRequest = {
 type SessionRecord = SessionSummary & {
   // No runtime handle to the Worker here — WorkerPool owns that.
   // We only track metadata for TTL + listing.
+  // When the pool reports the underlying Worker died, we mark the
+  // record so HTTP handlers can surface the canonical PRD code
+  // (`session_worker_crashed`) before reaping. After reaping the
+  // record is removed entirely.
+  crashed?: { reason: 'crash' | 'terminated' | 'init_failed'; message: string; at: Date }
 }
 
 export class SessionQuotaError extends Error {
@@ -91,6 +96,44 @@ export class SessionManager {
     this.credentials = options.credentials
     this.pool = options.pool
     this.ttlMs = options.ttlMs
+
+    // The pool announces dead Workers; we mark the session record so
+    // the next HTTP handler can surface session_worker_crashed and reap.
+    this.pool.setOnWorkerDied((ev) => this.handleWorkerDied(ev))
+  }
+
+  // Called by the WorkerPool when a slot's underlying Worker dies.
+  // We don't reap immediately — keeping the record briefly lets the
+  // client's in-flight request observe a clean error before getting a
+  // generic 404. Reap happens on the next HTTP read via consumeCrashed
+  // or, failing that, via the idle sweep.
+  //
+  // Graceful close paths (closeSession/shutdownAll) call dropSession
+  // BEFORE pool.shutdown fires the 'terminated' event, so by the time
+  // we get here the record is already gone — fast-path early-return.
+  private handleWorkerDied(ev: {
+    sessionId: string
+    reason: 'crash' | 'terminated' | 'init_failed'
+    message: string
+  }): void {
+    const rec = this.sessions.get(ev.sessionId)
+    if (!rec) return
+    rec.crashed = { reason: ev.reason, message: ev.message, at: new Date() }
+  }
+
+  // HTTP handlers call this to determine whether to surface a
+  // session_worker_crashed before any other handling. Returns the crash
+  // info (if any) AND removes the record from the index — frees the
+  // user's quota slot per PRD §Technical Risks mitigation.
+  consumeCrashed(
+    userId: string,
+    sessionId: string,
+  ): { reason: 'crash' | 'terminated' | 'init_failed'; message: string } | null {
+    const rec = this.sessions.get(sessionId)
+    if (!rec || rec.userId !== userId || !rec.crashed) return null
+    const { reason, message } = rec.crashed
+    this.dropSessionRecord(sessionId)
+    return { reason, message }
   }
 
   // Starts the idle-sweep timer. Idempotent.
@@ -239,7 +282,10 @@ export class SessionManager {
     return ids
   }
 
-  private dropSession(sessionId: string): void {
+  // Removes the record from indexes only. Does NOT touch the pool.
+  // Used after the Worker is already dead (consumeCrashed) or by
+  // dropSession which adds the pool teardown.
+  private dropSessionRecord(sessionId: string): void {
     const rec = this.sessions.get(sessionId)
     if (!rec) return
     this.sessions.delete(sessionId)
@@ -248,13 +294,26 @@ export class SessionManager {
       ids.delete(sessionId)
       if (ids.size === 0) this.byUser.delete(rec.userId)
     }
-    this.pool.shutdown(sessionId)
+  }
+
+  private dropSession(sessionId: string): void {
+    const had = this.sessions.has(sessionId)
+    this.dropSessionRecord(sessionId)
+    if (had) this.pool.shutdown(sessionId)
   }
 
   private sweepIdle(): void {
     if (this.stopped) return
     const cutoff = Date.now() - this.ttlMs
     for (const [sid, rec] of this.sessions) {
+      // Crashed records get reaped on the first sweep — they should
+      // have been consumed by consumeCrashed() during the failing
+      // request, but if the client gave up before reading we still need
+      // to free the quota slot.
+      if (rec.crashed) {
+        this.dropSessionRecord(sid)
+        continue
+      }
       if (rec.lastUsedAt.getTime() < cutoff) {
         this.dropSession(sid)
       }
