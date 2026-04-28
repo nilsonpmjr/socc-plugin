@@ -45,6 +45,10 @@ jobs:
         working-directory: socc-plugin
         run: bun run typecheck
 
+      - name: Guard headless imports
+        working-directory: socc-plugin
+        run: bun run guard:headless-imports
+
       # Split unit and integration tests into separate runs. The Bun
       # 1.3.12 runtime occasionally crashes when many Workers are spun
       # up across files in a single process; running them in two passes
@@ -90,6 +94,16 @@ jobs:
           tags: socc-plugin:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan image for high/critical CVEs
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: socc-plugin:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+          ignore-unfixed: true
 
       - name: Smoke boot
         # Runs the image with dummy Mongo — expects it to fail fast at

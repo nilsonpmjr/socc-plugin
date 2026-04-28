@@ -10,8 +10,12 @@
     "start": "bun run src/server/index.ts",
     "build": "bun build src/server/index.ts --target=bun --outfile=dist/server.mjs",
     "typecheck": "tsc --noEmit",
+    "guard:headless-imports": "bash scripts/headless-import-guard.sh",
+    "golden:conversations": "bun run scripts/golden-conversations.ts",
+    "load:test": "bun run scripts/load-test.ts",
+    "rotate:master-key": "bun run scripts/rotate-master-key.ts",
     "test": "bun test",
-    "test:unit": "bun test src/server/auth.test.ts src/server/credentials.test.ts src/server/streamAdapter.test.ts src/server/sessionManager.test.ts src/server/index.test.ts",
+    "test:unit": "bun test src/server/auth.test.ts src/server/credentials.test.ts src/server/credentials.store.test.ts src/server/providerTester.test.ts src/server/logger.test.ts src/server/oauthState.test.ts src/server/streamAdapter.test.ts src/server/sessionManager.test.ts src/server/index.test.ts src/server/toolsExecutor.test.ts src/server/messageStore.test.ts src/server/soccSkills.test.ts",
     "test:integration": "bun test src/server/integration/"
   },
   "dependencies": {

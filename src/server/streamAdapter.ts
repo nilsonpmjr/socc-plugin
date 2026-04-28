@@ -13,7 +13,7 @@
 //   content.delta   — incremental text token(s)
 //   content.done    — assistant turn text is complete
 //   tool.call.start — a tool invocation begins
-//   tool.call.end   — a tool invocation finishes (success or error)
+//   tool.call.done  — a tool invocation finishes (success or error). Aligns with PRD §Security wire contract.
 //   message.end     — the whole assistant response is complete
 //   error           — something broke; retriable flag included
 //   heartbeat       — periodic no-op for proxy keepalive (emitted by
@@ -52,7 +52,7 @@ export type SoccStreamEvent =
       toolName: string
     }
   | {
-      type: 'tool.call.end'
+      type: 'tool.call.done'
       messageId: string
       toolUseId: string
       ok: boolean
@@ -310,7 +310,7 @@ export function createStreamProjection(): StreamProjection {
       const directId = tr.toolUseId ?? tr.tool_use_id
       if (directId && openToolCalls.has(directId)) {
         out.push({
-          type: 'tool.call.end',
+          type: 'tool.call.done',
           messageId: mid,
           toolUseId: directId,
           ok: !(tr.isError ?? tr.is_error ?? false),
@@ -322,7 +322,7 @@ export function createStreamProjection(): StreamProjection {
         for (const b of blocks) {
           if (b.type === 'tool_result' && b.tool_use_id && openToolCalls.has(b.tool_use_id)) {
             out.push({
-              type: 'tool.call.end',
+              type: 'tool.call.done',
               messageId: mid,
               toolUseId: b.tool_use_id,
               ok: !(b.is_error ?? false),

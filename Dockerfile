@@ -59,8 +59,9 @@ USER socc
 EXPOSE 7070
 ENV NODE_ENV=production
 ENV PORT=7070
-# Path to the bundled sessionWorker (read by src/server/workerPool.ts).
-ENV SOCC_WORKER_URL=file:///app/dist/sessionWorker.mjs
+# sessionWorker.mjs is emitted alongside server.mjs by bun build.
+# workerPool.ts detects the bundled context via import.meta.url ending
+# in .mjs and resolves ./sessionWorker.mjs automatically — no env var needed.
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:7070/v1/health | grep -q '"status":"ok"' || exit 1

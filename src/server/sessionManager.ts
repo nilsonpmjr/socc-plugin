@@ -25,6 +25,7 @@
 
 import { ulid } from 'ulid'
 import type { CredentialsStore, ProviderCredential } from './credentials.ts'
+import type { MessageStore } from './messageStore.ts'
 import {
   PoolCapacityError,
   SessionNotFoundError,
@@ -33,6 +34,8 @@ import {
   TurnConflictError,
   WorkerPool,
 } from './workerPool.ts'
+import { appendSoccSkillsToSystemPrompt } from './soccSkills.ts'
+import { importClaudeCliAuth } from './localAuthImport.ts'
 
 export const MAX_SESSIONS_PER_USER = 3
 const SWEEP_INTERVAL_MS = 30_000
@@ -43,23 +46,29 @@ export type SessionSummary = {
   credentialId: string
   provider: ProviderCredential['provider']
   model: string
+  // PRD §v1.1: user-visible session label (optional rename).
+  sessionName?: string
+  // PRD §v1.1: pinned sessions survive TTL sweep.
+  pinned: boolean
   createdAt: Date
   lastUsedAt: Date
+  // Non-zero after first turn persisted.
+  messageCount: number
 }
 
 export type CreateSessionRequest = {
   userId: string
   credentialId: string
   systemPrompt?: string
+  sessionName?: string
+  enabledTools?: string[]
+}
+
+export type PatchSessionRequest = {
+  sessionName?: string
 }
 
 type SessionRecord = SessionSummary & {
-  // No runtime handle to the Worker here — WorkerPool owns that.
-  // We only track metadata for TTL + listing.
-  // When the pool reports the underlying Worker died, we mark the
-  // record so HTTP handlers can surface the canonical PRD code
-  // (`session_worker_crashed`) before reaping. After reaping the
-  // record is removed entirely.
   crashed?: { reason: 'crash' | 'terminated' | 'init_failed'; message: string; at: Date }
 }
 
@@ -85,6 +94,9 @@ export class SessionManager {
   private readonly pool: WorkerPool
   private readonly credentials: CredentialsStore
   private readonly ttlMs: number
+  // Optional — when absent, history is not persisted (e.g. dev without
+  // VANTAGE_API_URL or tests that don't need persistence).
+  private readonly messages: MessageStore | null
   private sweepTimer: ReturnType<typeof setInterval> | null = null
   private stopped = false
 
@@ -92,10 +104,12 @@ export class SessionManager {
     credentials: CredentialsStore
     pool: WorkerPool
     ttlMs: number
+    messages?: MessageStore
   }) {
     this.credentials = options.credentials
     this.pool = options.pool
     this.ttlMs = options.ttlMs
+    this.messages = options.messages ?? null
 
     // The pool announces dead Workers; we mark the session record so
     // the next HTTP handler can surface session_worker_crashed and reap.
@@ -156,12 +170,39 @@ export class SessionManager {
     const cred = await this.credentials.get(req.userId, req.credentialId)
     if (!cred) throw new CredentialNotFoundError(req.credentialId)
 
-    let apiKey: string
+    let secret: Awaited<ReturnType<CredentialsStore['decryptAuthSecret']>>
     try {
-      apiKey = await this.credentials.decryptKey(req.userId, req.credentialId)
+      secret = await this.credentials.decryptAuthSecret(req.userId, req.credentialId)
     } catch {
       throw new CredentialNotFoundError(req.credentialId)
     }
+    if (secret.authMode === 'claude_cli') {
+      const sourcePath =
+        typeof secret.profile?.sourcePath === 'string'
+          ? secret.profile.sourcePath
+          : undefined
+      try {
+        const imported = await importClaudeCliAuth(process.env, sourcePath)
+        secret = {
+          ...secret,
+          apiKey: imported.accessToken,
+          profile: {
+            ...(secret.profile ?? {}),
+            organizationUuid: imported.organizationUuid,
+            subscriptionType: imported.subscriptionType,
+            rateLimitTier: imported.rateLimitTier,
+            expiresAt: imported.expiresAt,
+          },
+        }
+      } catch {
+        throw new CredentialNotFoundError(req.credentialId)
+      }
+    }
+    const baseUrl =
+      cred.baseUrl ??
+      (secret.authMode === 'codex_cli'
+        ? 'https://chatgpt.com/backend-api/codex'
+        : undefined)
 
     const sessionId = ulid()
     const now = new Date()
@@ -170,11 +211,19 @@ export class SessionManager {
       sessionId,
       userId: req.userId,
       provider: cred.provider,
-      apiKey,
-      baseUrl: cred.baseUrl,
+      authMode: secret.authMode,
+      apiKey: secret.apiKey,
+      accountId:
+        typeof secret.profile?.accountId === 'string'
+          ? secret.profile.accountId
+          : typeof secret.profile?.organizationUuid === 'string'
+            ? secret.profile.organizationUuid
+          : cred.accountId,
+      baseUrl,
       model: cred.defaultModel,
       maxOutputTokens: cred.maxOutputTokens,
-      systemPrompt: req.systemPrompt,
+      systemPrompt: await appendSoccSkillsToSystemPrompt(req.systemPrompt),
+      enabledTools: req.enabledTools,
     }
 
     await this.pool.spawn(init)
@@ -185,11 +234,34 @@ export class SessionManager {
       credentialId: req.credentialId,
       provider: cred.provider,
       model: cred.defaultModel,
+      sessionName: req.sessionName,
+      pinned: false,
+      messageCount: 0,
       createdAt: now,
       lastUsedAt: now,
     }
     this.sessions.set(sessionId, rec)
     this.indexForUser(req.userId).add(sessionId)
+    return { ...rec }
+  }
+
+  // ── session metadata mutations (PRD §v1.1) ───────────────────────
+
+  patchSession(userId: string, sessionId: string, patch: PatchSessionRequest): SessionSummary {
+    const rec = this.requireOwned(userId, sessionId)
+    if (patch.sessionName !== undefined) rec.sessionName = patch.sessionName
+    return { ...rec }
+  }
+
+  pinSession(userId: string, sessionId: string): SessionSummary {
+    const rec = this.requireOwned(userId, sessionId)
+    rec.pinned = true
+    return { ...rec }
+  }
+
+  unpinSession(userId: string, sessionId: string): SessionSummary {
+    const rec = this.requireOwned(userId, sessionId)
+    rec.pinned = false
     return { ...rec }
   }
 
@@ -216,6 +288,74 @@ export class SessionManager {
     const rec = this.sessions.get(sessionId)
     if (!rec || rec.userId !== userId) return
     this.pool.abortTurn(sessionId, turnId)
+  }
+
+  // PRD §v1.1: persist a single turn after the stream completes.
+  // Safe to call from the SSE handler because the manager is the single
+  // source of truth for userId+sessionId ownership.
+  async recordTurn(
+    userId: string,
+    sessionId: string,
+    turnId: string,
+    role: 'user' | 'assistant',
+    content: string,
+  ): Promise<void> {
+    if (!this.messages) return
+    const rec = this.sessions.get(sessionId)
+    if (!rec || rec.userId !== userId) return
+    try {
+      await this.messages.save({ sessionId, userId, role, content, turnId })
+      rec.messageCount++
+    } catch {
+      // Persistence failure MUST NOT break the streaming response.
+      // Log would be useful here but we don't hold a logger reference.
+    }
+  }
+
+  // ── history & export (PRD §v1.1 + §LGPD) ─────────────────────────
+
+  async listHistory(
+    userId: string,
+    sessionId: string,
+    options?: { limit?: number; before?: string },
+  ) {
+    if (!this.messages) return []
+    const rec = this.sessions.get(sessionId)
+    if (!rec || rec.userId !== userId) return []
+    return this.messages.list(userId, sessionId, options)
+  }
+
+  async exportHistory(userId: string, sessionId: string) {
+    if (!this.messages) return []
+    const rec = this.sessions.get(sessionId)
+    if (!rec || rec.userId !== userId) return []
+    return this.messages.exportSession(userId, sessionId)
+  }
+
+  // LGPD wipeout for a user (called from Vantage deactivate hook).
+  async deleteUserHistory(userId: string): Promise<number> {
+    if (!this.messages) return 0
+    return this.messages.deleteByUser(userId)
+  }
+
+  // Forwards a tool_response to the Worker. Scoped by userId for the
+  // same defense-in-depth rationale as abortTurn — even though only the
+  // SSE handler that originally received the tool_request can reach
+  // here, we never trust the caller's claim of session ownership.
+  forwardToolResponse(
+    userId: string,
+    sessionId: string,
+    msg: {
+      requestId: string
+      ok: boolean
+      data?: unknown
+      errorCode?: string
+      errorMessage?: string
+    },
+  ): void {
+    const rec = this.sessions.get(sessionId)
+    if (!rec || rec.userId !== userId) return
+    this.pool.forwardToolResponse(sessionId, msg)
   }
 
   closeSession(userId: string, sessionId: string): void {
@@ -314,7 +454,8 @@ export class SessionManager {
         this.dropSessionRecord(sid)
         continue
       }
-      if (rec.lastUsedAt.getTime() < cutoff) {
+      // Pinned sessions are kept alive by the user — skip TTL reap.
+      if (!rec.pinned && rec.lastUsedAt.getTime() < cutoff) {
         this.dropSession(sid)
       }
     }

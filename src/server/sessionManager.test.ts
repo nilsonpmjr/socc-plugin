@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import type { CredentialsStore, ProviderCredential } from './credentials.ts'
 import {
   CredentialNotFoundError,
@@ -11,7 +14,7 @@ import type { SessionInit, TurnEvent, WorkerPool } from './workerPool.ts'
 
 // Minimal stubs — we're testing coordination logic, not Mongo or Bun Workers.
 
-type CredOverride = Partial<ProviderCredential> & { apiKey?: string }
+type CredOverride = Partial<ProviderCredential> & { apiKey?: string; authProfile?: Record<string, unknown> }
 
 function makeCreds(
   byId: Record<string, { userId: string; override?: CredOverride }>,
@@ -37,7 +40,16 @@ function makeCreds(
     if (!entry || entry.userId !== userId) throw new Error('not found')
     return entry.override?.apiKey ?? 'sk-plaintext'
   }
-  return { get, decryptKey } as unknown as CredentialsStore
+  const decryptAuthSecret = async (userId: string, id: string) => {
+    const entry = byId[id]
+    if (!entry || entry.userId !== userId) throw new Error('not found')
+    return {
+      apiKey: entry.override?.apiKey ?? 'sk-plaintext',
+      authMode: entry.override?.authMode ?? 'api_key',
+      profile: entry.override?.authProfile ?? (entry.override?.accountId ? { accountId: entry.override.accountId } : undefined),
+    }
+  }
+  return { get, decryptKey, decryptAuthSecret } as unknown as CredentialsStore
 }
 
 type PoolCalls = {
@@ -46,6 +58,14 @@ type PoolCalls = {
   abort: Array<{ sessionId: string; turnId?: string }>
   shutdown: string[]
   shutdownAll: number
+  toolResponses: Array<{
+    sessionId: string
+    requestId: string
+    ok: boolean
+    data?: unknown
+    errorCode?: string
+    errorMessage?: string
+  }>
 }
 
 function makePool(options: {
@@ -58,6 +78,7 @@ function makePool(options: {
     abort: [],
     shutdown: [],
     shutdownAll: 0,
+    toolResponses: [],
   }
   const yieldsFor =
     options.runYields ?? (() => [{ kind: 'end', reason: 'complete' }] as TurnEvent[])
@@ -88,6 +109,12 @@ function makePool(options: {
       onDied = h
       return prev
     },
+    forwardToolResponse: (
+      sessionId: string,
+      msg: { requestId: string; ok: boolean; data?: unknown; errorCode?: string; errorMessage?: string },
+    ) => {
+      calls.toolResponses.push({ sessionId, ...msg })
+    },
     __fireDied: (sessionId: string, reason = 'crash', message = 'simulated') => {
       onDied?.({ sessionId, reason, message })
     },
@@ -110,6 +137,45 @@ describe('SessionManager.createSession', () => {
     expect(calls.spawn.length).toBe(1)
     expect(calls.spawn[0].apiKey).toBe('sk-plaintext')
     expect(calls.spawn[0].sessionId).toBe(s.sessionId)
+    expect(calls.spawn[0].systemPrompt).toContain('## Skill: payload-triage')
+  })
+
+  test('re-reads Claude CLI OAuth token from the local credential store before spawning', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'socc-claude-session-'))
+    const credentialsPath = join(dir, '.credentials.json')
+    await writeFile(
+      credentialsPath,
+      JSON.stringify({
+        organizationUuid: 'org_runtime_123',
+        claudeAiOauth: {
+          accessToken: 'runtime-claude-access-token',
+          expiresAt: 1777777777000,
+          subscriptionType: 'pro',
+          rateLimitTier: 'default_claude_ai',
+        },
+      }),
+      'utf8',
+    )
+    const creds = makeCreds({
+      c1: {
+        userId: 'u1',
+        override: {
+          authMode: 'claude_cli',
+          apiKey: 'stored-placeholder',
+          authProfile: { sourcePath: credentialsPath },
+        },
+      },
+    })
+    const { pool, calls } = makePool()
+    const sm = new SessionManager({ credentials: creds, pool, ttlMs: 60_000 })
+
+    await sm.createSession({ userId: 'u1', credentialId: 'c1' })
+
+    expect(calls.spawn[0]).toMatchObject({
+      authMode: 'claude_cli',
+      apiKey: 'runtime-claude-access-token',
+      accountId: 'org_runtime_123',
+    })
   })
 
   test('rejects when user hits the per-user quota', async () => {
@@ -289,5 +355,59 @@ describe('SessionManager listing + quota release on close', () => {
       credentialId: `c${MAX_SESSIONS_PER_USER}`,
     })
     expect(s.userId).toBe('u1')
+  })
+})
+
+describe('SessionManager.forwardToolResponse + enabledTools (Fase 5)', () => {
+  test('createSession forwards enabledTools to the worker init payload', async () => {
+    const creds = makeCreds({ c1: { userId: 'u1' } })
+    const { pool, calls } = makePool()
+    const sm = new SessionManager({ credentials: creds, pool, ttlMs: 60_000 })
+    await sm.createSession({
+      userId: 'u1',
+      credentialId: 'c1',
+      enabledTools: ['query_feed', 'analyze_ioc'],
+    })
+    expect(calls.spawn[0].enabledTools).toEqual(['query_feed', 'analyze_ioc'])
+  })
+
+  test('createSession preserves caller system prompt before SOC skills', async () => {
+    const creds = makeCreds({ c1: { userId: 'u1' } })
+    const { pool, calls } = makePool()
+    const sm = new SessionManager({ credentials: creds, pool, ttlMs: 60_000 })
+
+    await sm.createSession({
+      userId: 'u1',
+      credentialId: 'c1',
+      systemPrompt: 'Prefer concise PT-BR answers.',
+    })
+
+    expect(calls.spawn[0].systemPrompt).toStartWith('Prefer concise PT-BR answers.')
+    expect(calls.spawn[0].systemPrompt).toContain('## Skill: soc-generalist')
+  })
+
+  test('forwardToolResponse only delivers when the caller owns the session', async () => {
+    const creds = makeCreds({ c1: { userId: 'u1' } })
+    const { pool, calls } = makePool()
+    const sm = new SessionManager({ credentials: creds, pool, ttlMs: 60_000 })
+    const s = await sm.createSession({ userId: 'u1', credentialId: 'c1' })
+
+    // Owner can forward.
+    sm.forwardToolResponse('u1', s.sessionId, {
+      requestId: 'req-1',
+      ok: true,
+      data: { items: [] },
+    })
+    expect(calls.toolResponses).toEqual([
+      { sessionId: s.sessionId, requestId: 'req-1', ok: true, data: { items: [] } },
+    ])
+
+    // Stranger silently no-ops; nothing reaches the pool.
+    sm.forwardToolResponse('intruder', s.sessionId, {
+      requestId: 'req-2',
+      ok: true,
+      data: { stolen: true },
+    })
+    expect(calls.toolResponses).toHaveLength(1)
   })
 })

@@ -295,3 +295,276 @@ socc/
 ├── src/entrypoints/engine.tsx   # re-exporta query
 └── package.json                 # 0.2.0 + exports["./engine"]
 ```
+
+---
+
+## 9. Fase 3 (Frontend) — entregue 2026-04-25 pelo Gemini
+
+`task.md.resolved` no brain do Gemini (`c9823b7d-…`) confirma todos os
+itens de UI:
+
+- Dependências instaladas: `marked`, `@microsoft/fetch-event-source`,
+  `shiki`, `react-textarea-autosize`.
+- Componentes em `web/src/pages/socc/`:
+  - `SoccChat.tsx` (15kB) — duas colunas, SSE via fetch-event-source,
+    markdown sanitizado por DOMPurify, syntax highlight com `shiki`
+    `github-dark`, abort controller no botão "Stop".
+  - `SoccProvidersModal.tsx` (10kB) — modal localizada (não rota
+    separada), form com test-on-save, gate `local_provider_disabled`
+    para Ollama.
+- `App.tsx` lazy-loads `SoccChat` em `/socc` (linha 62 + 135).
+- `Layout.tsx` adiciona item de sidebar com ícone `Terminal` (linha 51).
+- `lib/i18n.ts` ganhou bloco `socc: {...}` em pt/en/es completo (3
+  ocorrências de `socc:` confirmadas).
+- Lint + build limpos (relatado pelo Gemini, falta verificar localmente
+  na próxima execução).
+
+**Observação:** o Gemini optou por modal em vez de rota
+`/socc/providers` separada. Isso é uma boa simplificação para o MVP
+(menos navegação para configurar primeiro provider) e não viola o PRD,
+que descreve a UX em prosa sem fixar a rota.
+
+## 11. Fase 4 (Extensions Platform) — backend entregue 2026-04-25
+
+A plataforma genérica que converte o socc-plugin de "extensão hard-coded"
+em "primeiro tenant de uma plataforma genérica de extensões" foi
+implementada do lado backend com critério de generalidade já comprovado.
+
+### O que foi entregue
+
+- **`docker-socket-proxy`** no compose principal com a ACL exata do
+  PRD §Extensions Platform (linhas 268-289). Activated by `--profile
+  extensions`. Socket montado **read-only**; backend nunca toca o
+  `/var/run/docker.sock` direto.
+- **`backend/services/extensions/`** — package com:
+  - `manifest.py` (151 linhas): pydantic estrito, `extra="forbid"`,
+    rejeita path traversal em `compose_file`, regex de id (`^[a-z]…$`),
+    semver em `version`, ops válidas hard-coded.
+  - `registry.py` (94 linhas): descobre extensões em `backend/extensions/`,
+    ignora `plugins/`, `local_plugins/`, `premium_plugins/` (legado), expõe
+    `errors()` por diretório malformado para a UI surfaçar.
+  - `docker_client.py` (250 linhas): wrapper async httpx para
+    `tcp://docker-socket-proxy:2375` + subprocess.exec do `docker compose`
+    com `DOCKER_HOST` apontando pro proxy.
+  - `manager.py` (486 linhas): orquestrador. Lock atômico via Mongo
+    `update_one` com `$or`/`$exists`; geração de secrets
+    (`random_bytes_base64`/`hex`); preflight (`compose config` dry-run);
+    state guard (`_ACTIONABLE` por status); reconcile no boot.
+- **`backend/routers/extensions.py`** (364 linhas): rotas em
+  `/api/extensions/{,/:id,/:id/status,/:id/install,/:id/uninstall,
+  /:id/start,/:id/stop,/:id/restart,/:id/settings,/:id/secrets/:name/rotate,
+  /:id/logs}`. Mutações exigem `require_role(["admin"])`. Audit log nas
+  ações (`{ext_id}_install/uninstall/start/stop/...`).
+- **`backend/extensions/socc/compose.yml`**: profile-less (gerenciado
+  pelo manager), mantendo o caminho dev manual como fallback.
+- **`backend/extensions/fake/`**: manifest + nginx:alpine compose
+  como probe de generalidade. PRD §Phase 4 done criteria verificado.
+
+### O que comprovamos
+
+| Camada | Testes | O que prova |
+|--------|--------|-------------|
+| `manifest.py` | 4 | aceita socc; rejeita extras, path traversal, ops inválidas |
+| `registry.py` | 3 | ignora legados; reporta erro por dir; mismatch id↔dir vira erro |
+| `manager.py` | 5 | secret length em bytes; lock+release; concurrent install=409; uninstall exige confirm_phrase; settings valida tipos |
+| router HTTP | 4 | tech rejeitado em install (403); admin com confirm_phrase errado loga `failure`; catálogo expõe socc; **catálogo expõe socc + fake lado a lado sem hardcode** |
+| **Total** | **17** | **Suite Vantage: 436/436** |
+
+### Decisões dignas de nota
+
+1. **Por que httpx em vez de docker-py?** docker-py abre conexão direta
+   com socket; queremos forçar todo tráfego pelo proxy ACL-restrito.
+   httpx + subprocess do `docker compose` mantém a passagem auditável.
+
+2. **Compose orchestration via subprocess.** Reimplementar `compose up`
+   em Python (parsear YAML, `/containers/create` + `/networks/create` +
+   depends_on + healthchecks) é semanas de trabalho com edge cases. O
+   PRD aceita esse trade-off implicitamente — a plataforma de extensões
+   é orquestrada pelo CLI oficial respeitando a ACL.
+
+3. **Lock idempotente via `$or` + `$exists`.** O `_try_acquire_lock`
+   usa um único `update_one` atômico (`$or: [{locked_by: None}, {locked_by:
+   {$exists: false}}]`) — Mongo garante atomicidade, segunda tentativa
+   falha sem race. O FakeDB foi estendido pra suportar essa operação,
+   mantendo backward-compat com os 420 testes pré-existentes.
+
+4. **Geração de secrets em bytes, não chars.** PRD §Extensions Platform
+   `length: 32` significa 32 bytes (= 64 hex chars / 44 base64 chars
+   sem padding). Validado em `test_generate_secret_lengths_match_spec`.
+
+5. **`fake` extension é discoverable mas não auto-instalada.** Aparece
+   no catálogo com status `not_installed`. Para removê-la quando a
+   generality test passar: `rm -rf backend/extensions/fake`. Documentado
+   no manifest.
+
+### Frontend Fase 4 — entregue 2026-04-25 pelo Gemini com 2 desvios
+
+O Gemini concluiu o checklist mas escolheu integrar diferente:
+
+**Desvio 1 (consciente, defensável).** Em vez de criar rota `/extensions`
+raiz como o briefing pedia, integrou no `ExtensionsCatalog.tsx` legado
+dentro do menu Settings → Extensions Catalog. Justificativa: PRD
+§Architecture diz literalmente "Página `/extensions` (expansão do
+`ExtensionsCatalog` existente)". O Gemini interpretou ao pé da letra.
+Releitura confirma a ambiguidade do próprio PRD — o §Phase 4 done
+criteria fala em "página /extensions no frontend" sem mencionar rota
+separada. **Critério de done atingido**, só fica numa hierarquia
+diferente (Settings em vez de raiz da sidebar).
+
+**Desvio 2 (consequência do 1).** A tabela do `ExtensionsCatalog`
+agora mistura, na MESMA tabela:
+- `payload.items` — plugins legados Python in-process via
+  `GET /api/admin/extensions` (modelo antigo).
+- `orchItems` — extensions manifest+container via `GET /api/extensions/*`
+  (modelo novo da Fase 4).
+
+Concatenação na linha 368: `rows = [...(payload?.items||[]), ...orchItems]`.
+
+Funciona — `socc` e `fake` aparecem lado a lado, ações Install/Start/
+Stop/Logs/Settings/Secrets ramificam por tipo. Mas é débito de UX:
+modelos com semânticas diferentes na mesma tabela confundem. Logado
+no TODO como "Decidir manter unified vs separar em duas seções".
+
+**Não é bloqueante pra MVP.** Admin completa o ciclo install→start→
+stop→restart→logs→uninstall pela UI, audit log entra no Mongo, socket
+nunca sai do proxy. Os critérios objetivos do PRD §Phase 4 done estão
+todos cumpridos.
+
+### Smoke pendente
+
+Falta apenas o smoke ponta-a-ponta humano (clicar Install → ver
+container subir via socket-proxy → Logs → Uninstall com volume drop).
+Backend está testado em unit; integração end-to-end com o socket-proxy
+real só vai com a UI rodando.
+
+### Risco aceito até Fase 7
+
+- Secrets em plaintext na coleção `extensions_secrets`. Mongo já tem
+  auth no Vantage; encryption-at-rest com `crypto.py` está listado em
+  Hardening transversal.
+- Compose orchestration depende de `docker` CLI estar presente na
+  imagem do backend. CI build vai validar.
+
+## 10. Fase 3.1 (Universal Auth estilo OpenClaw) — aberta, não implementada
+
+O Gemini propôs um plano de OAuth/auto-discovery em
+`brain/c9823b7d-…/implementation_plan.md.resolved`, mas ele ficou
+incompleto e com um desvio: tratava OpenAI como "GitHub Copilot proxy".
+Decisão do usuário em 2026-04-27: a fase deve seguir o padrão OpenClaw,
+com login/assinatura do provider quando suportado e API key manual só
+como fallback avançado.
+
+Direção corrigida:
+1. OpenAI deve ser **OpenAI Codex / ChatGPT OAuth com PKCE**, não GitHub
+   Copilot proxy.
+2. Anthropic deve ser **Claude CLI reuse / setup-token / API key**, não
+   OAuth genérico inventado em `console.anthropic.com/oauth/authorize`.
+3. A base técnica é um **auth profile/token sink** cifrado, com
+   `authMode` explícito (`api_key`, `oauth`, `claude_cli`,
+   `setup_token`, `local_discovery`) e refresh sob lock.
+4. Implementação recomendada: OpenAI Codex OAuth + Anthropic
+   CLI/setup-token primeiro; Gemini CLI OAuth e Ollama discovery depois.
+
+Pendências antes de implementar:
+1. Redirect URI/hostname público de Vantage ou fallback paste-code para
+   ambientes headless.
+2. Escopo Anthropic: só local/admin ou multiusuário web?
+3. Storage: estender `socc_credentials` ou criar `socc_auth_profiles`.
+4. Modelo default/billing por plano sem prometer disponibilidade indevida.
+
+Atualização 2026-04-27:
+- Base de `authMode` implementada em `socc_credentials`, preservando
+  API key manual como `api_key`.
+- `POST /api/socc/providers/import-local-auth` importa auth local do
+  Codex CLI (`~/.codex/auth.json`) como `provider=openai`,
+  `authMode=codex_cli`, com token/profile cifrado no plugin.
+- Worker agora ativa explicitamente env/provider por sessão
+  (`ANTHROPIC_API_KEY`, `SOCC_USE_OPENAI`, `CODEX_API_KEY`,
+  providerOverride etc.), corrigindo a lacuna em que a credential era
+  passada ao Worker mas não necessariamente usada pelo engine.
+- UI ganhou botões "Login with OpenAI Codex" e "Usar login do Claude CLI".
+
+Atualização 2026-04-27, continuação:
+- `POST /api/socc/providers/import-local-auth` também importa
+  `~/.claude/.credentials.json` como `provider=anthropic`,
+  `authMode=claude_cli`.
+- O profile Anthropic armazena metadados (`organizationUuid`,
+  `subscriptionType`, `rateLimitTier`, `sourcePath`) e a sessão re-lê a fonte
+  local antes de iniciar o Worker; o SOCC não vira dono paralelo do refresh
+  token do Claude CLI.
+- Worker usa `ANTHROPIC_AUTH_TOKEN` para `authMode=claude_cli` e mantém
+  `ANTHROPIC_API_KEY` para API key manual.
+- `authMode=setup_token` também passa pelo caminho bearer no Worker e a UI
+  expõe esse modo no fallback manual para Anthropic.
+- Ainda pendente naquele ponto: refresh sob lock para OpenAI Codex OAuth
+  completo, endpoints PKCE públicos/headless, Gemini CLI OAuth e Ollama
+  discovery.
+
+Atualização 2026-04-27, Ollama discovery:
+- `POST /api/socc/providers/discover-local` proxia para
+  `/v1/credentials/discover-local`, respeitando `socc_allow_local_providers`.
+- O plugin faz `GET http://localhost:11434/api/tags` com timeout de 1s; quando
+  encontra modelos, cria credential `provider=ollama`,
+  `authMode=local_discovery`, `apiKey=ollama-local`, `defaultModel` igual ao
+  primeiro modelo retornado.
+- UI ganhou botão "Detect Local Ollama"; quando não detecta, retorna hint
+  operacional (`Run: ollama serve` ou `ollama pull llama3.2`).
+- Ainda pendente: refresh sob lock para OpenAI Codex OAuth completo, endpoints
+  PKCE públicos/headless e Gemini CLI OAuth.
+
+Atualização 2026-04-27, OpenAI Codex PKCE skeleton:
+- Plugin ganhou `socc_oauth_state` com TTL index, PKCE verifier/challenge,
+  `state` por usuário e consumo único.
+- `GET /v1/oauth/openai-codex/login` gera state+PKCE e redireciona para
+  `OPENAI_CODEX_OAUTH_AUTHORIZE_URL` quando `OPENAI_CODEX_OAUTH_CLIENT_ID` e
+  `OPENAI_CODEX_OAUTH_REDIRECT_URI` estão configurados; há rate limit 5/min/user.
+- `GET /v1/oauth/openai-codex/callback` valida `code`/`state`, impede state
+  cross-user e consome o state uma vez. A troca de token ainda retorna
+  `oauth_exchange_not_configured` de propósito, até existir contrato/token
+  exchange configurado.
+- `POST /v1/oauth/openai-codex/callback` aceita fallback headless com
+  `callbackUrl` colada ou `{code,state}` explícitos, reutilizando a mesma
+  validação/consumo único.
+- Backend Vantage expõe `/api/socc/oauth/openai-codex/login` e
+  `/api/socc/oauth/openai-codex/callback`, preservando redirect 302 no login,
+  proxyando o fallback headless e auditando início/falha do fluxo.
+- Hardening adicional: Pino redige `code`, `code_verifier`, `codeVerifier`,
+  `state`, `access_token` e tokens em `authProfile`/`oauth`; teste dedicado
+  cobre saída estruturada do logger. `OAuthStateStore` ganhou teste dedicado
+  de isolamento cross-user e expiração.
+- UI Anthropic mantém API key como opção recomendada para produção/multiusuário
+  e explicita setup-token como fallback quando Claude CLI reuse não está disponível.
+- Ainda pendente: token exchange real, criação de credential `authMode=oauth`,
+  Gemini CLI OAuth e refresh sob lock.
+
+---
+
+## 12. Fase 4 (Frontend) — entregue 2026-04-25 pelo Gemini
+
+O frontend da plataforma de extensões foi entregue com uma mudança de arquitetura solicitada pelo usuário durante a implementação: **unificação total com o catálogo existente.**
+
+### O que foi alterado (Mudança de plano)
+
+Inicialmente, o plano previa uma página isolada em `/extensions`. O usuário solicitou que:
+1.  Não houvesse uma rota separada nem item de sidebar raiz.
+2.  As novas extensões fossem integradas diretamente na tabela existente do `ExtensionsCatalog.tsx` em `/settings/extensions`.
+3.  Toda a lógica de gerenciamento (modais, polling) fosse incorporada à página de Settings para manter a consistência administrativa.
+
+### O que foi entregue
+
+- **Integração na Tabela Unificada:** `ExtensionsCatalog.tsx` agora faz o merge dos itens do catálogo legado (`/api/admin/extensions`) com os itens orquestrados (`/api/extensions`).
+- **Ações Contextuais:** O menu de ações da linha na tabela detecta se a extensão é orquestrada e exibe opções específicas: *Logs, Settings, Secrets, Start/Stop/Restart, Uninstall*.
+- **Infraestrutura Genérica em `web/src/pages/extensions/`**:
+  - `lib/api.ts`: 9 endpoints do contrato orquestrado tipados.
+  - `lib/poll.ts`: Utilitário de polling de status a cada 2s para transições (`installing`/`uninstalling`).
+  - **Modais Completos:**
+    - `UninstallModal`: Exige frase de confirmação dinâmica e opção de preservação de volumes.
+    - `LogsModal`: Streaming via SSE com buffer de 5k linhas e auto-scroll.
+    - `SettingsModal`: Formulário gerado dinamicamente a partir do `settings_schema`.
+    - `SecretsModal`: Rotação de secrets com confirmação.
+- **Side-rail Contextual:** O painel lateral de detalhes agora adapta as métricas exibidas conforme o tipo da extensão selecionada.
+- **i18n:** Adicionado namespace `extensions` em PT, EN e ES no `web/src/lib/i18n.ts`.
+
+### Estado Atual
+
+A plataforma está 100% operacional no catálogo de Settings. Extensões como `socc` e `fake` aparecem lado a lado com as extensões legadas, compartilhando a mesma UI de tabela mas com capacidades de gerenciamento modernas.

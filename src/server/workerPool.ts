@@ -24,6 +24,12 @@ export type SessionInit = Omit<WorkerInitMessage, 'type'>
 
 export type TurnEvent =
   | { kind: 'engine'; event: unknown }
+  | {
+      kind: 'tool_request'
+      requestId: string
+      name: string
+      args: Record<string, unknown>
+    }
   | { kind: 'end'; reason: 'complete' | 'aborted' | 'error'; errorMessage?: string }
 
 // Notification fired when a Worker becomes unusable (crash, internal
@@ -40,13 +46,18 @@ export class WorkerPool {
   private readonly workers = new Map<string, WorkerSlot>()
   private readonly maxConcurrent: number
   private onWorkerDied: ((ev: WorkerDiedEvent) => void) | null
+  // Explicit Worker entry-point override (used in integration tests to
+  // inject a synthetic worker without relying on env vars).
+  private readonly workerUrlOverride: string | null
 
   constructor(options: {
     maxConcurrent: number
     onWorkerDied?: (ev: WorkerDiedEvent) => void
+    workerUrl?: string
   }) {
     this.maxConcurrent = options.maxConcurrent
     this.onWorkerDied = options.onWorkerDied ?? null
+    this.workerUrlOverride = options.workerUrl ?? null
   }
 
   // Subscribe to worker-died events post-construction. Last writer wins;
@@ -82,13 +93,15 @@ export class WorkerPool {
       )
     }
 
-    const slot = new WorkerSlot(init, (reason, message) => {
-      // Only fire once per slot; subsequent terminate/onFatal calls are
-      // a no-op so callers can safely cascade them.
-      if (this.onWorkerDied) {
-        this.onWorkerDied({ sessionId: init.sessionId, reason, message })
-      }
-    })
+    const slot = new WorkerSlot(
+      init,
+      (reason, message) => {
+        if (this.onWorkerDied) {
+          this.onWorkerDied({ sessionId: init.sessionId, reason, message })
+        }
+      },
+      this.workerUrlOverride ?? undefined,
+    )
     this.workers.set(init.sessionId, slot)
     try {
       await slot.ready()
@@ -120,6 +133,31 @@ export class WorkerPool {
     const slot = this.workers.get(sessionId)
     if (!slot || slot.dead) return
     slot.post({ type: 'abort', turnId })
+  }
+
+  // Sends a tool_response back to the Worker that emitted the matching
+  // tool_request. Silently no-op for unknown sessions / dead slots so
+  // the SSE handler doesn't have to special-case shutdown races.
+  forwardToolResponse(
+    sessionId: string,
+    msg: {
+      requestId: string
+      ok: boolean
+      data?: unknown
+      errorCode?: string
+      errorMessage?: string
+    },
+  ): void {
+    const slot = this.workers.get(sessionId)
+    if (!slot || slot.dead) return
+    slot.post({
+      type: 'tool_response',
+      requestId: msg.requestId,
+      ok: msg.ok,
+      data: msg.data,
+      errorCode: msg.errorCode,
+      errorMessage: msg.errorMessage,
+    })
   }
 
   // Terminates a single session's Worker. Safe to call for unknown ids.
@@ -169,15 +207,25 @@ class WorkerSlot {
       reason: 'crash' | 'terminated' | 'init_failed',
       message: string,
     ) => void,
+    workerUrlOverride?: string,
   ) {
     this.sessionId = init.sessionId
     this.notifyDied = notifyDied
-    // In dev, the worker source sits at ../sessionWorker.ts. When the
-    // server is bundled for prod, bun emits ../sessionWorker.mjs next to
-    // the main bundle; SOCC_WORKER_URL lets the container point at it.
-    const workerUrl =
-      process.env.SOCC_WORKER_URL ??
-      new URL('../sessionWorker.ts', import.meta.url).href
+    // Resolve the Worker entry-point.
+    //
+    // Priority order:
+    //   1. `workerUrlOverride` — injected by tests via WorkerPool constructor.
+    //   2. Auto-detect: bundled (.mjs context) uses ./sessionWorker.mjs;
+    //      dev (.ts context) uses ../sessionWorker.ts.
+    let workerUrl: string
+    if (workerUrlOverride) {
+      workerUrl = workerUrlOverride
+    } else {
+      const isBundled = !import.meta.url.endsWith('.ts')
+      workerUrl = isBundled
+        ? new URL('./sessionWorker.mjs', import.meta.url).href
+        : new URL('../sessionWorker.ts', import.meta.url).href
+    }
     this.worker = new Worker(workerUrl, {
       type: 'module',
     })
@@ -249,6 +297,20 @@ class WorkerSlot {
       case 'event':
         this.pushTurn(msg.turnId, { kind: 'engine', event: (msg as WorkerEventMessage).event })
         return
+      case 'tool_request': {
+        // PRD §AI System Requirements: the Worker can't call Vantage
+        // directly (it doesn't hold the JWT secret). It asks the server
+        // by emitting tool_request; the SSE handler in index.ts catches
+        // this kind, runs the HTTP round-trip, and replies with
+        // forwardToolResponse() below.
+        this.pushTurn(msg.turnId, {
+          kind: 'tool_request',
+          requestId: msg.requestId,
+          name: msg.name,
+          args: msg.args,
+        })
+        return
+      }
       case 'turn_end': {
         const m = msg as WorkerTurnEndMessage
         this.pushTurn(m.turnId, {

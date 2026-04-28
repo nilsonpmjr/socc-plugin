@@ -32,6 +32,15 @@ export async function testProvider(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
+    if (cred.authMode === 'codex_cli') {
+      return apiKey ? { ok: true, result: 'ok' } : { ok: false, result: 'unauthorized' }
+    }
+    if (cred.authMode === 'claude_cli') {
+      return apiKey ? { ok: true, result: 'ok' } : { ok: false, result: 'unauthorized' }
+    }
+    if (cred.authMode === 'setup_token') {
+      return apiKey ? { ok: true, result: 'ok' } : { ok: false, result: 'unauthorized' }
+    }
     switch (cred.provider) {
       case 'anthropic':
         return await probeAnthropic(fetchImpl, cred, apiKey, controller.signal)

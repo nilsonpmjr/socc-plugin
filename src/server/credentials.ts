@@ -14,6 +14,13 @@ import { Binary, type Collection, type Db } from 'mongodb'
 import { ulid } from 'ulid'
 
 export type Provider = 'anthropic' | 'openai' | 'gemini' | 'ollama'
+export type AuthMode =
+  | 'api_key'
+  | 'oauth'
+  | 'codex_cli'
+  | 'claude_cli'
+  | 'setup_token'
+  | 'local_discovery'
 
 export type TestResult =
   | 'ok'
@@ -25,6 +32,8 @@ export type CreateCredentialInput = {
   provider: Provider
   label: string
   apiKey: string
+  authMode?: AuthMode
+  authProfile?: Record<string, unknown>
   baseUrl?: string
   defaultModel: string
   maxOutputTokens?: number
@@ -34,8 +43,10 @@ export type ProviderCredential = {
   id: string
   userId: string
   provider: Provider
+  authMode?: AuthMode
   label: string
   keyPreview: string
+  accountId?: string
   baseUrl?: string
   defaultModel: string
   maxOutputTokens: number
@@ -46,14 +57,22 @@ export type ProviderCredential = {
   revokedAt?: Date
 }
 
+export type AuthSecret = {
+  apiKey: string
+  authMode: AuthMode
+  profile?: Record<string, unknown>
+}
+
 // Mongo document shape (ciphertext + nonce kept out of ProviderCredential
 // so consumers can't accidentally serialize them to a response body).
 type CredentialDoc = {
   _id: string
   userId: string
   provider: Provider
+  authMode?: AuthMode
   label: string
   keyPreview: string
+  accountId?: string
   baseUrl?: string
   defaultModel: string
   maxOutputTokens: number
@@ -64,12 +83,17 @@ type CredentialDoc = {
   lastTestResult?: TestResult
   revoked: boolean
   revokedAt?: Date
+  refreshLock?: {
+    owner: string
+    expiresAt: Date
+  }
 }
 
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096
 const MASTER_KEY_LENGTH = 32
 // PRD §Security — at most 20 provider credentials per user.
 export const MAX_CREDENTIALS_PER_USER = 20
+const DEFAULT_REFRESH_LOCK_TTL_MS = 30_000
 
 // Only the last 4 chars of the key are shown; prefix depends on provider
 // conventions but we don't parse — the user's raw prefix stays visible.
@@ -78,13 +102,67 @@ function previewOf(apiKey: string): string {
   return `${apiKey.slice(0, 3)}...${apiKey.slice(-4)}`
 }
 
+function previewFor(input: CreateCredentialInput): string {
+  if (input.authMode === 'codex_cli') {
+    const accountId =
+      typeof input.authProfile?.accountId === 'string'
+        ? input.authProfile.accountId
+        : undefined
+    return accountId ? `codex:${accountId.slice(0, 6)}...` : 'codex:local'
+  }
+  if (input.authMode === 'oauth') return 'oauth:profile'
+  if (input.authMode === 'claude_cli') return 'claude:local'
+  if (input.authMode === 'setup_token') return 'anthropic:setup-token'
+  if (input.authMode === 'local_discovery') return 'local'
+  return previewOf(input.apiKey)
+}
+
+function plaintextFor(input: CreateCredentialInput): string {
+  if (input.authProfile) {
+    return JSON.stringify({
+      ...input.authProfile,
+      authMode: input.authMode ?? 'api_key',
+      apiKey: input.apiKey,
+    })
+  }
+  return input.apiKey
+}
+
+function plaintextForSecret(secret: AuthSecret): string {
+  if (secret.profile) {
+    return JSON.stringify({
+      ...secret.profile,
+      authMode: secret.authMode,
+      apiKey: secret.apiKey,
+    })
+  }
+  return secret.apiKey
+}
+
+function previewForSecret(secret: AuthSecret): string {
+  if (secret.authMode === 'codex_cli') {
+    const accountId =
+      typeof secret.profile?.accountId === 'string'
+        ? secret.profile.accountId
+        : undefined
+    return accountId ? `codex:${accountId.slice(0, 6)}...` : 'codex:local'
+  }
+  if (secret.authMode === 'oauth') return 'oauth:profile'
+  if (secret.authMode === 'claude_cli') return 'claude:local'
+  if (secret.authMode === 'setup_token') return 'anthropic:setup-token'
+  if (secret.authMode === 'local_discovery') return 'local'
+  return previewOf(secret.apiKey)
+}
+
 function toDoc(cred: ProviderCredential, ciphertext: Binary, nonce: Binary): CredentialDoc {
   return {
     _id: cred.id,
     userId: cred.userId,
     provider: cred.provider,
+    authMode: cred.authMode,
     label: cred.label,
     keyPreview: cred.keyPreview,
+    accountId: cred.accountId,
     baseUrl: cred.baseUrl,
     defaultModel: cred.defaultModel,
     maxOutputTokens: cred.maxOutputTokens,
@@ -103,8 +181,10 @@ function fromDoc(doc: CredentialDoc): ProviderCredential {
     id: doc._id,
     userId: doc.userId,
     provider: doc.provider,
+    authMode: doc.authMode ?? 'api_key',
     label: doc.label,
     keyPreview: doc.keyPreview,
+    accountId: doc.accountId,
     baseUrl: doc.baseUrl,
     defaultModel: doc.defaultModel,
     maxOutputTokens: doc.maxOutputTokens,
@@ -113,6 +193,13 @@ function fromDoc(doc: CredentialDoc): ProviderCredential {
     lastTestResult: doc.lastTestResult,
     revoked: doc.revoked,
     revokedAt: doc.revokedAt,
+  }
+}
+
+export class AuthProfileRefreshLockedError extends Error {
+  readonly code = 'auth_profile_refresh_locked'
+  constructor(public readonly credentialId: string) {
+    super(`credential ${credentialId} already has an active auth refresh lock`)
   }
 }
 
@@ -148,17 +235,23 @@ export class CredentialsStore {
     this.assertReady()
     const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
     const ciphertext = sodium.crypto_secretbox_easy(
-      sodium.from_string(input.apiKey),
+      sodium.from_string(plaintextFor(input)),
       nonce,
       this.masterKey,
     )
+    const authMode = input.authMode ?? 'api_key'
 
     const cred: ProviderCredential = {
       id: ulid(),
       userId,
       provider: input.provider,
+      authMode,
       label: input.label,
-      keyPreview: previewOf(input.apiKey),
+      keyPreview: previewFor(input),
+      accountId:
+        typeof input.authProfile?.accountId === 'string'
+          ? input.authProfile.accountId
+          : undefined,
       baseUrl: input.baseUrl,
       defaultModel: input.defaultModel,
       maxOutputTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
@@ -201,6 +294,102 @@ export class CredentialsStore {
       this.masterKey,
     )
     return sodium.to_string(plaintext)
+  }
+
+  async decryptAuthSecret(userId: string, id: string): Promise<{
+    apiKey: string
+    authMode: AuthMode
+    profile?: Record<string, unknown>
+  }> {
+    const raw = await this.decryptKey(userId, id)
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>
+      const authMode =
+        parsed.authMode === 'codex_cli' ||
+        parsed.authMode === 'oauth' ||
+        parsed.authMode === 'claude_cli' ||
+        parsed.authMode === 'setup_token' ||
+        parsed.authMode === 'local_discovery' ||
+        parsed.authMode === 'api_key'
+          ? parsed.authMode
+          : 'api_key'
+      const apiKey = typeof parsed.apiKey === 'string' ? parsed.apiKey : raw
+      return { apiKey, authMode, profile: parsed }
+    } catch {
+      return { apiKey: raw, authMode: 'api_key' }
+    }
+  }
+
+  async refreshAuthSecretWithLock(
+    userId: string,
+    id: string,
+    updater: (current: AuthSecret) => AuthSecret | null | Promise<AuthSecret | null>,
+    options: { owner?: string; ttlMs?: number } = {},
+  ): Promise<AuthSecret | null> {
+    this.assertReady()
+    const owner = options.owner ?? ulid()
+    const now = new Date()
+    const expiresAt = new Date(now.getTime() + (options.ttlMs ?? DEFAULT_REFRESH_LOCK_TTL_MS))
+
+    const lock = await this.col.updateOne(
+      {
+        _id: id,
+        userId,
+        revoked: false,
+        $or: [
+          { refreshLock: { $exists: false } },
+          { 'refreshLock.expiresAt': { $lte: now } },
+          { 'refreshLock.owner': owner },
+        ],
+      },
+      { $set: { refreshLock: { owner, expiresAt } } },
+    )
+    if (lock.matchedCount === 0) {
+      throw new AuthProfileRefreshLockedError(id)
+    }
+
+    try {
+      const current = await this.decryptAuthSecret(userId, id)
+      const next = await updater(current)
+      if (!next) return null
+
+      const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+      const ciphertext = sodium.crypto_secretbox_easy(
+        sodium.from_string(plaintextForSecret(next)),
+        nonce,
+        this.masterKey,
+      )
+      const accountId =
+        typeof next.profile?.accountId === 'string'
+          ? next.profile.accountId
+          : undefined
+      const write = await this.col.updateOne(
+        {
+          _id: id,
+          userId,
+          revoked: false,
+          'refreshLock.owner': owner,
+        },
+        {
+          $set: {
+            ciphertext: new Binary(ciphertext),
+            nonce: new Binary(nonce),
+            authMode: next.authMode,
+            keyPreview: previewForSecret(next),
+            accountId,
+          },
+        },
+      )
+      if (write.matchedCount === 0) {
+        throw new AuthProfileRefreshLockedError(id)
+      }
+      return next
+    } finally {
+      await this.col.updateOne(
+        { _id: id, userId, 'refreshLock.owner': owner },
+        { $unset: { refreshLock: '' } },
+      )
+    }
   }
 
   async revoke(userId: string, id: string): Promise<void> {

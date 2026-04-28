@@ -89,7 +89,7 @@ describe('streamAdapter.createStreamProjection', () => {
       },
     })
     expect(close).toEqual([
-      { type: 'tool.call.end', messageId: 'msg_1', toolUseId: 'toolu_1', ok: true, errorMessage: undefined },
+      { type: 'tool.call.done', messageId: 'msg_1', toolUseId: 'toolu_1', ok: true, errorMessage: undefined },
     ])
   })
 
@@ -105,7 +105,7 @@ describe('streamAdapter.createStreamProjection', () => {
         content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'boom' }],
       },
     })
-    expect(out[0]).toMatchObject({ type: 'tool.call.end', ok: false, errorMessage: 'boom' })
+    expect(out[0]).toMatchObject({ type: 'tool.call.done', ok: false, errorMessage: 'boom' })
   })
 
   test('unknown event types are silently ignored', () => {

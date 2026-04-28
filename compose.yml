@@ -14,7 +14,7 @@ services:
       # Context is the parent so the Dockerfile can COPY ../socc.
       context: ..
       dockerfile: socc-plugin/Dockerfile
-    image: socc-plugin:dev
+    image: socc-plugin:local
     restart: unless-stopped
     ports:
       - "7070:7070"
@@ -28,7 +28,14 @@ services:
       MAX_CONCURRENT_SESSIONS: ${MAX_CONCURRENT_SESSIONS:-50}
       TURN_TIMEOUT_MS: ${TURN_TIMEOUT_MS:-90000}
       SOCC_ALLOW_LOCAL_PROVIDERS: ${SOCC_ALLOW_LOCAL_PROVIDERS:-false}
+      MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
+      VANTAGE_API_URL: ${VANTAGE_API_URL:-}
+      OPENAI_CODEX_OAUTH_CLIENT_ID: ${OPENAI_CODEX_OAUTH_CLIENT_ID:-}
+      OPENAI_CODEX_OAUTH_REDIRECT_URI: ${OPENAI_CODEX_OAUTH_REDIRECT_URI:-}
+      OPENAI_CODEX_OAUTH_AUTHORIZE_URL: ${OPENAI_CODEX_OAUTH_AUTHORIZE_URL:-https://auth.openai.com/oauth/authorize}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      - vantage_internal
     depends_on:
       socc-mongo:
         condition: service_healthy
@@ -44,6 +51,8 @@ services:
     restart: unless-stopped
     volumes:
       - socc-mongo-data:/data/db
+    networks:
+      - vantage_internal
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 10s
@@ -53,3 +62,8 @@ services:
 
 volumes:
   socc-mongo-data:
+
+networks:
+  vantage_internal:
+    name: threat-intelligence-tool_vantage_internal
+    external: true

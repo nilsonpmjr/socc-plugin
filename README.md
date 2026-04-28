@@ -102,7 +102,7 @@ issuer `vantage`, audience `socc-plugin`, scope `socc`.
 
 SSE event types: `session.ready`, `message.start`, `content.delta`,
 `content.done` (with `content` + `usage`), `tool.call.start`,
-`tool.call.end`, `message.end` (with `stopReason`), `error` (with
+`tool.call.done`, `message.end` (with `stopReason`), `error` (with
 reserved `code`), `heartbeat` (with `ts`). See
 [src/server/streamAdapter.ts](src/server/streamAdapter.ts) for the full
 payload shapes.
@@ -118,7 +118,8 @@ See [.env.example](.env.example). Required secrets:
 
 - `SOCC_INTERNAL_SECRET` — 32-byte hex HS256 secret shared with Vantage.
 - `SOCC_MASTER_KEY` — 32-byte hex key for libsodium secretbox.
-  Rotating this invalidates every stored credential.
+  Rotate it with the offline re-encrypt runbook in
+  [docs/master-key-rotation.md](docs/master-key-rotation.md).
 
 Tunables:
 
@@ -136,6 +137,18 @@ Per-user caps (PRD §Security):
 - 3 live sessions (hard-coded in `sessionManager.ts`).
 - 20 provider credentials (`MAX_CREDENTIALS_PER_USER` in
   `credentials.ts`).
+
+## Load testing
+
+Use [docs/load-test.md](docs/load-test.md) and `bun run load:test` against a
+running plugin to measure the PRD target: 50 sessions, 10 messages/second,
+P95 TTFT under 3 seconds, and zero retriable SSE errors.
+
+## Golden conversations
+
+Use [docs/golden-conversations.md](docs/golden-conversations.md) and
+`bun run golden:conversations` to run 20 scripted SSE conversations per hosted
+provider (Anthropic, OpenAI, Gemini).
 
 ## Layout
 

@@ -17,7 +17,7 @@
 // assertions because §US-4 AC3 is a wire-level requirement — 404 vs
 // 403 matters at the response, not just at the manager.
 
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import { SignJWT } from 'jose'
 import { CredentialsStore } from '../credentials.ts'
 import { JWT_AUDIENCE, JWT_ISSUER, JWT_SCOPE, JwtVerifier } from '../auth.ts'
@@ -102,6 +102,11 @@ function makeInMemCreds() {
       if (!c) throw new Error('not found')
       return plaintext.get(id)!
     },
+    async decryptAuthSecret(userId: string, id: string) {
+      const c = byUserId.get(userId)?.get(id)
+      if (!c) throw new Error('not found')
+      return { apiKey: plaintext.get(id)!, authMode: 'api_key' as const }
+    },
     async revoke(userId: string, id: string) {
       const c = byUserId.get(userId)?.get(id)
       if (c) c.revoked = true
@@ -147,7 +152,7 @@ type Harness = {
 
 function buildHarness(): Harness {
   const credentials = makeInMemCreds()
-  const pool = new WorkerPool({ maxConcurrent: 20 })
+  const pool = new WorkerPool({ maxConcurrent: 20, workerUrl: SYNTH_WORKER_URL })
   const sessions = new SessionManager({ credentials, pool, ttlMs: 60_000 })
   const jwt = new JwtVerifier(JWT_SECRET_HEX)
   const app = buildApp({ credentials, sessions, jwt, turnTimeoutMs: 30_000 })
@@ -171,18 +176,7 @@ async function seedCred(
   })
 }
 
-// ── module-scoped setup: point WorkerPool at the synthetic worker ──
-
-const ORIGINAL_WORKER_URL = process.env.SOCC_WORKER_URL
-
-beforeAll(() => {
-  process.env.SOCC_WORKER_URL = SYNTH_WORKER_URL
-})
-
-afterAll(() => {
-  if (ORIGINAL_WORKER_URL === undefined) delete process.env.SOCC_WORKER_URL
-  else process.env.SOCC_WORKER_URL = ORIGINAL_WORKER_URL
-})
+// ── shared harness now passes workerUrl directly (no env var) ──
 
 // ── the tests ──────────────────────────────────────────────────────
 
@@ -579,7 +573,7 @@ describe('worker crash recovery (PRD §Technical Risks mitigation)', () => {
   test('crashed session is also reaped on TTL sweep if HTTP never reads it', async () => {
     // Build a manager with a tiny TTL and start the sweep timer.
     const credentials = makeInMemCreds()
-    const pool = new WorkerPool({ maxConcurrent: 5 })
+    const pool = new WorkerPool({ maxConcurrent: 5, workerUrl: SYNTH_WORKER_URL })
     // 0ms TTL means every record looks expired on the next sweep tick.
     const sessions = new SessionManager({ credentials, pool, ttlMs: 0 })
     const jwt = new JwtVerifier(JWT_SECRET_HEX)
